@@ -1,16 +1,16 @@
 {
   "name": "analyseman",
   "version": "1.0.0",
+  "description": "Discord bot voor trade logging, leaderboards en trader totals",
   "main": "index.js",
-  "license": "MIT",
   "scripts": {
     "start": "node index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   },
   "dependencies": {
-    "discord.js": "^14.15.0",
+    "discord.js": "^14.15.3",
     "node-cron": "^3.0.3"
   }
 }
