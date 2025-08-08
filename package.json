@@ -1,7 +1,7 @@
 {
   "name": "analyseman",
-  "version": "1.0.0",
-  "description": "Discord bot voor trade logging, leaderboards en trader totals",
+  "version": "2.0.0",
+  "description": "Discord trade logger & leaderboard bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
