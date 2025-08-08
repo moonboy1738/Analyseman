@@ -1,4 +1,4 @@
-// ===== Analyseman — leaderboard clean format + names (CommonJS) =====
+// ===== Analyseman — stabiele fetch, strakke leaderboards, namen + async replies =====
 const cron = require('node-cron');
 const {
   Client,
@@ -11,6 +11,7 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 
+// ---- Config uit Heroku (met fallbacks) ----
 const TRADE_LOG_ID = process.env.TRADE_LOG_CHANNEL || '1395887706755829770';
 const LEADERBOARD_ID = process.env.LEADERBOARD_CHANNEL || '1395887166890184845';
 const TZ = process.env.TZ || 'Europe/Amsterdam';
@@ -25,27 +26,8 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ---------------- helpers ----------------
-async function fetchAllMessages(channel, days = null) {
-  const out = [];
-  let lastId;
-  const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
-
-  while (true) {
-    const opts = { limit: 100 };
-    if (lastId) opts.before = lastId;
-    const batch = await channel.messages.fetch(opts);
-    if (batch.size === 0) break;
-
-    for (const m of batch.values()) {
-      if (cutoff && m.createdTimestamp < cutoff) return out;
-      out.push(m);
-    }
-    lastId = batch.last().id;
-  }
-  return out;
-}
-
+// ---------- Utils ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
 function normalizeNumber(raw) {
@@ -83,28 +65,55 @@ function cleanContent(content) {
     .trim();
 }
 
-// ---- better PnL extraction ----
+// ---------- Messages fetch (rate-limit safe) ----------
+async function fetchAllMessages(channel, days = null) {
+  const out = [];
+  let lastId;
+  const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
+
+  while (true) {
+    const opts = { limit: 100 };
+    if (lastId) opts.before = lastId;
+
+    const batch = await channel.messages.fetch(opts);
+    if (batch.size === 0) break;
+
+    // push while respecting cutoff
+    for (const m of batch.values()) {
+      if (cutoff && m.createdTimestamp < cutoff) return out;
+      out.push(m);
+    }
+    lastId = batch.last().id;
+
+    // kleine pauze om rate-limits te vermijden
+    await sleep(250);
+  }
+  return out;
+}
+
+// ---------- PnL extraction ----------
 function extractPnl(raw, side, entry, exit) {
   // 1) labels
   const labeled = raw.match(/\b(pnl|p&l|roi|return)\b[^%\-+]*([-+]?[\d.,]+)\s*%/i);
   if (labeled) {
     const val = normalizeNumber(labeled[2]);
-    if (Number.isFinite(val) && Math.abs(val) <= 1000) return val;
+    if (Number.isFinite(val) && Math.abs(val) <= 2000) return val;
   }
   // 2) compute from entry/exit
   if (side && entry != null && exit != null) {
     const val = computePnlPercent({ side, entry, exit });
-    if (Number.isFinite(val) && Math.abs(val) <= 1000) return val;
+    if (Number.isFinite(val) && Math.abs(val) <= 2000) return val;
   }
-  // 3) single percent in text
-  const all = [...raw.matchAll(/([-+]?[\d.,]+)\s*%/g)].map(m => normalizeNumber(m[1])).filter(Number.isFinite);
-  if (all.length === 1 && Math.abs(all[0]) <= 1000) return all[0];
+  // 3) één enkel percentage in tekst
+  const all = [...raw.matchAll(/([-+]?[\d.,]+)\s*%/g)]
+    .map(m => normalizeNumber(m[1]))
+    .filter(Number.isFinite);
+  if (all.length === 1 && Math.abs(all[0]) <= 2000) return all[0];
 
-  // 4) otherwise give up (we vermijden noise zoals “24h +3.2%”)
   return null;
 }
 
-// ---- ultra-lenient parser with username ----
+// ---------- Parser (lenient + namen) ----------
 function parseTrade(msg) {
   const raw = cleanContent(msg.content);
   if (!raw) return null;
@@ -118,7 +127,7 @@ function parseTrade(msg) {
   const sideMatch = raw.match(/\b(LONG|SHORT)\b/i);
   const side = sideMatch ? sideMatch[1].toUpperCase() : null;
 
-  // Prefer symbols like BTC, ETH, SOL, or BTCUSDT/ETHUSD, trim suffixes
+  // symbol (BTC, ETH, SOL, BTCUSDT, ETH/USD, etc.) – strip suffixes
   let symbol = null;
   const sym = raw.match(/\b([A-Z]{2,10})(?:-?PERP|USDT|USD|USDC)?\b/) || raw.match(/\b([A-Z]{2,10})\/[A-Z]{2,6}\b/);
   if (sym) {
@@ -137,8 +146,7 @@ function parseTrade(msg) {
   let pnl = extractPnl(raw, side, entry, exit);
   if (pnl == null || !Number.isFinite(pnl)) return null;
 
-  // safety clamp to avoid garbage outliers
-  pnl = clamp(pnl, -1000, 1000);
+  pnl = clamp(pnl, -2000, 2000);
 
   const guildId = msg.guild?.id || '000000000000000000';
   const link = `https://discord.com/channels/${guildId}/${msg.channelId}/${msg.id}`;
@@ -146,25 +154,40 @@ function parseTrade(msg) {
   return { id: msg.id, link, trader, side, symbol, entry, exit, lev, pnl, ts: msg.createdTimestamp };
 }
 
-// --------------- leaderboard ---------------
-function pad(n, len) {
-  const s = String(n);
-  return s.length >= len ? s : '0'.repeat(len - s.length) + s;
+// ---------- Leaderboard ----------
+function padLeft(str, len) {
+  const s = String(str);
+  return s.length >= len ? s : ' '.repeat(len - s.length) + s;
+}
+function padRight(str, len) {
+  const s = String(str);
+  return s.length >= len ? s.slice(0, len) : s + ' '.repeat(len - s.length);
+}
+function medal(i) {
+  return i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : padLeft(i + 1, 2) + '.';
 }
 
-function fmtLine(t, i) {
-  // Example: 01) -12.34%  BTC  SHORT  5x  by MoonBoy — Trade
-  const rank = pad(i + 1, 2);
-  const pnl = `${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}%`;
-  const parts = [
-    `${rank}) ${pnl}`,
-    t.symbol ? t.symbol : '—',
-    t.side || '—',
-    t.lev ? `${t.lev}x` : null,
-    `by ${t.trader}`,
-    `[Trade](${t.link})`,
-  ].filter(Boolean);
-  return parts.join('  ·  ');
+function formatRows(trades) {
+  // kolommen: Rank | PnL% | Sym | Side | Lev | Trader | Link
+  const lines = [];
+  lines.push('```');
+  lines.push(padRight('Rank', 6) + padRight('PnL%', 9) + padRight('Sym', 6) + padRight('Side', 8) + padRight('Lev', 6) + 'Trader');
+  lines.push('-'.repeat(60));
+  trades.forEach((t, i) => {
+    const rank = padRight(medal(i), 6);
+    const pnl = padRight(`${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}%`, 9);
+    const sym = padRight(t.symbol || '—', 6);
+    const side = padRight(t.side || '—', 8);
+    const lev = padRight(t.lev ? `${t.lev}x` : '—', 6);
+    const trader = t.trader || '—';
+    lines.push(rank + pnl + sym + side + lev + trader);
+  });
+  lines.push('```');
+  // aparte linkregeltjes (anders breken codeblocks de links)
+  trades.forEach((t, i) => {
+    lines.push(`${padLeft(i + 1, 2)} ▸ [Trade](${t.link})`);
+  });
+  return lines.join('\n');
 }
 
 async function buildLeaderboard(days = 7, topN = 10, wins = true) {
@@ -173,10 +196,9 @@ async function buildLeaderboard(days = 7, topN = 10, wins = true) {
   const trades = messages.map(parseTrade).filter(t => t && Number.isFinite(t.pnl));
 
   const sorted = trades.sort((a, b) => wins ? b.pnl - a.pnl : a.pnl - b.pnl);
-  const top = sorted.slice(0, topN); // altijd exact topN (als er genoeg zijn)
+  const top = sorted.slice(0, topN);
 
-  const lines = top.map((t, i) => fmtLine(t, i));
-  const desc = lines.join('\n').slice(0, 3900) || '_Geen geldige trades gevonden in de periode._';
+  const desc = top.length ? formatRows(top).slice(0, 3900) : '_Geen geldige trades gevonden in de periode._';
 
   const embed = new EmbedBuilder()
     .setColor(wins ? 0x2ecc71 : 0xe74c3c)
@@ -200,6 +222,7 @@ async function postAndPin(embed, tag) {
   await sent.pin().catch(() => {});
 }
 
+// ---------- Jobs ----------
 async function runWeeklyTop10() {
   const wins = await buildLeaderboard(7, 10, true);
   await postAndPin(wins, '[ANALYSEMAN-DAILY]');
@@ -211,7 +234,7 @@ async function runAllTimeTop50() {
   await postAndPin(losses, '[ANALYSEMAN-ALLTIME-LOSS]');
 }
 
-// --------------- ready ---------------
+// ---------- Ready ----------
 client.once('ready', async () => {
   console.log(`[Analyseman] Ingelogd als ${client.user.tag}`);
 
@@ -230,6 +253,7 @@ client.once('ready', async () => {
   const okLB = need.every(p => leaderboard.permissionsFor(me)?.has(p));
   console.log(`[Analyseman] Perms trade-log OK: ${okTrade}, leaderboard OK: ${okLB}`);
 
+  // Cron (Amsterdam TZ)
   cron.schedule('0 9 * * *', async () => {
     console.log('[Analyseman] Trigger: daily weekly top10 (09:00 Europe/Amsterdam)');
     try { await runWeeklyTop10(); console.log('[Analyseman] Daily top10 posted.'); }
@@ -242,4 +266,46 @@ client.once('ready', async () => {
     catch (e) { console.error('[Analyseman] Weekly job error:', e); }
   }, { timezone: TZ });
 
-  console.log('[Analyseman] Cron jobs registered with timezone:',
+  console.log('[Analyseman] Cron jobs registered with timezone:', TZ);
+
+  // Slash-commands: guild (direct zichtbaar) of global
+  try {
+    const commands = [
+      new SlashCommandBuilder().setName('lb_daily').setDescription('Post de Top 10 van de week (nu)'),
+      new SlashCommandBuilder().setName('lb_alltime').setDescription('Post de Top 50 all-time wins & losses (nu)'),
+    ].map(c => c.toJSON());
+
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    if (GUILD_ID) {
+      await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: commands });
+      console.log('[Analyseman] Slash commands geregistreerd voor guild:', GUILD_ID);
+    } else {
+      await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+      console.warn('[Analyseman] Geen GUILD_ID/SERVER_ID, commands GLOBAL (kan ~1u duren).');
+    }
+  } catch (e) {
+    console.error('[Analyseman] Slash command deploy error:', e);
+  }
+});
+
+// ---------- Interactions (asynchroon + snelle reply) ----------
+client.on('interactionCreate', async (i) => {
+  if (!i.isChatInputCommand()) return;
+
+  if (i.commandName === 'lb_daily') {
+    await i.deferReply({ ephemeral: true });
+    i.editReply('⏳ Bezig met berekenen (week)…');
+    try { await runWeeklyTop10(); await i.editReply('✅ Week Top 10 gepost & gepind.'); }
+    catch (e) { console.error(e); await i.editReply('❌ Fout bij posten van Week Top 10.'); }
+  }
+
+  if (i.commandName === 'lb_alltime') {
+    await i.deferReply({ ephemeral: true });
+    i.editReply('⏳ Bezig met berekenen (all-time, dit kan even duren)…');
+    try { await runAllTimeTop50(); await i.editReply('✅ All-time Top 50 wins & losses gepost & gepind.'); }
+    catch (e) { console.error(e); await i.editReply('❌ Fout bij posten van All-time Top 50.'); }
+  }
+});
+
+// ---------- Start ----------
+client.login(process.env.DISCORD_TOKEN);
