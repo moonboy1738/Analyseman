@@ -1,0 +1,16 @@
+{
+  "name": "analyseman",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.0",
+    "node-cron": "^3.0.3"
+  }
+}
