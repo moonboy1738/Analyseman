@@ -11,11 +11,12 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 
-// ========= Config uit Heroku (met veilige fallbacks) =========
+// ========= Config uit Heroku (met fallbacks) =========
 const TRADE_LOG_ID = process.env.TRADE_LOG_CHANNEL || '1395887706755829770';
 const LEADERBOARD_ID = process.env.LEADERBOARD_CHANNEL || '1395887166890184845';
 const TZ = process.env.TZ || 'Europe/Amsterdam';
-const GUILD_ID = process.env.GUILD_ID || null;
+// Gebruik GUILD_ID, anders SERVER_ID, anders null
+const GUILD_ID = process.env.GUILD_ID || process.env.SERVER_ID || null;
 
 // ========= Client =========
 const client = new Client({
@@ -27,7 +28,7 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ========= Utilities =========
+// ========= Helpers =========
 async function fetchAllMessages(channel, days = null) {
   let messages = [];
   let lastId;
@@ -233,7 +234,7 @@ client.once('ready', async () => {
       );
       console.log('[Analyseman] Slash commands geregistreerd voor guild:', GUILD_ID);
     } else {
-      console.warn('[Analyseman] Geen GUILD_ID gezet; registreer GLOBAL (kan ~1u duren).');
+      console.warn('[Analyseman] Geen GUILD_ID/SERVER_ID gezet; registreer GLOBAL (kan ~1u duren).');
       await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
       console.log('[Analyseman] Slash commands GLOBAL geregistreerd');
     }
