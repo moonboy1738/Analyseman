@@ -21,9 +21,9 @@ const PREFIX = '!';
 const TZ = 'Europe/Amsterdam';
 
 // JOUW KANALEN
-const INPUT_CHANNEL_ID     = '1397658460211908801'; // 🖊️∣-input
-const TRADE_LOG_CHANNEL_ID = '1395887706755829770'; // 📝∣-trade-log
-const LEADERBOARD_CHANNEL_ID = '1395887166890184845'; // 🥇∣-leaderboard
+const INPUT_CHANNEL_ID        = '1397658460211908801'; // 🖊️∣-input
+const TRADE_LOG_CHANNEL_ID    = '1395887706755829770'; // 📝∣-trade-log
+const LEADERBOARD_CHANNEL_ID  = '1395887166890184845'; // 🥇∣-leaderboard
 
 // ====== CLIENT ======
 const client = new Client({
@@ -45,19 +45,32 @@ const numVal = (s) => {
   const n = Number(clean);
   return Number.isFinite(n) ? n : null;
 };
-const isLev = (t) => /^-?\d{1,3}x?$/i.test(String(t)); // 5..500, optioneel x
+
+const isLev = (t) => /^-?\d{1,3}x?$/i.test(String(t)); // bv. 30 of 30x
 const parseLev = (t) => {
   const m = String(t).toLowerCase().replace(/x$/,'');
   const n = Number(m);
   return Number.isInteger(n) ? n : null;
 };
 const isPercent = (t) => /%$/.test(String(t));
+
 const fixedMoney = (n) => {
   if (n == null) return '';
-  // wat jij in screenshots hebt: kleine coins 2 decimalen ook OK
-  // we doen: >= 1 → 2 dec; anders → 4 dec
   return n >= 1 ? n.toFixed(2) : n.toFixed(4);
 };
+
+// Naam zoals jij ’m wil: server-bijnaam → displaynaam → globalName → tag → username
+function getTraderNaam(user, member) {
+  return (
+    member?.nickname ||
+    member?.displayName ||
+    user?.globalName ||
+    (user?.username && user?.discriminator ? `${user.username}#${user.discriminator}` : null) ||
+    user?.tag || // fallback voor oudere accounts
+    user?.username ||
+    'Onbekend'
+  );
+}
 
 // ====== POSTING: INPUT -> TRADE LOG ======
 async function handleTradePost({ guild, user, member, symbol, side, leverage, entry, exit, pnl }) {
@@ -68,7 +81,7 @@ async function handleTradePost({ guild, user, member, symbol, side, leverage, en
   }
   if (!Number.isFinite(pnl)) throw new Error('PNL missing/invalid');
 
-  const displayName = member?.displayName || user?.username || 'Onbekend';
+  const traderNaam = getTraderNaam(user, member);
   const sign = pnl >= 0 ? '+' : '';
   const levText = leverage ? ` ${leverage}x` : '';
 
@@ -78,13 +91,13 @@ async function handleTradePost({ guild, user, member, symbol, side, leverage, en
     `Trade geregistreerd: **${symbol} ${side}**${levText} → **${sign}${pnl.toFixed(2)}%**`
   );
 
-  // 2) format in trade-log EXACT zoals je wil
+  // 2) format in trade-log EXACT zoals je screenshot
   const logCh = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   const lines = [
-    `${displayName} — ${sign}${pnl.toFixed(2)}%`,
+    `${traderNaam} — ${sign}${pnl.toFixed(2)}%`,
     `${symbol} ${side}${levText}`,
     `Entry: $${fixedMoney(entry)}`,
-    `Exit: $${fixedMoney(exit)}`,
+    `Exit: $${fixedMoney(exit)}`
   ].join('\n');
 
   await logCh.send(lines);
@@ -109,7 +122,7 @@ async function fetchAllMessages(channel, days = null) {
   return out;
 }
 
-// We parsen alléén posts die wij zelf naar #trade-log hebben gestuurd, exact ons format:
+// We parsen alléén de door-bot-geplaatste logs (ons eigen formaat):
 function parseTradeLogMessage(msg) {
   if (msg.author.id !== client.user.id) return null;
 
@@ -218,7 +231,7 @@ async function buildTotals({ days = null, topN = 25 }) {
 // ====== SCHEDULED POSTS ======
 async function postAndPin(embed, tagFooterText) {
   const lbCh = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-  // Verwijder oude pin met zelfde footer-tag
+  // oude pin met zelfde tag unpinnen
   const pins = await lbCh.messages.fetchPinned().catch(()=>null);
   const old = pins?.find(p => p.embeds[0]?.footer?.text === tagFooterText);
   if (old) await old.unpin().catch(()=>{});
@@ -280,7 +293,7 @@ client.on('messageCreate', async (message) => {
     return message.reply('Gebruik: `!trade add SYMBOL LONG|SHORT ENTRY EXIT [LEVERAGE] [PNL%]` (bv. `!trade add PENG LONG 0.03674 0.03755 30`)');
   }
 
-  // leverage overal toegestaan
+  // leverage mag overal staan (wij halen hem eruit, komt achteraan te staan)
   let leverage = null;
   for (let i = parts.length - 1; i >= 0; i--) {
     if (isLev(parts[i])) {
@@ -301,7 +314,7 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // pak de eerste twee cijfers die overblijven: entry/exit
+  // pak de eerste twee nummers die over zijn: entry/exit
   const nums = [];
   for (const t of parts) {
     const n = numVal(t);
