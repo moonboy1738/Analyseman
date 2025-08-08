@@ -1,4 +1,4 @@
-// ===== Analyseman — volledige bot (CommonJS) =====
+// ===== Analyseman — volledige bot met ultra-lenient parser (CommonJS) =====
 const cron = require('node-cron');
 const {
   Client,
@@ -15,7 +15,6 @@ const {
 const TRADE_LOG_ID = process.env.TRADE_LOG_CHANNEL || '1395887706755829770';
 const LEADERBOARD_ID = process.env.LEADERBOARD_CHANNEL || '1395887166890184845';
 const TZ = process.env.TZ || 'Europe/Amsterdam';
-// Gebruik GUILD_ID, anders SERVER_ID, anders null
 const GUILD_ID = process.env.GUILD_ID || process.env.SERVER_ID || null;
 
 // ========= Client =========
@@ -51,19 +50,19 @@ async function fetchAllMessages(channel, days = null) {
 }
 
 function normalizeNumber(raw) {
-  if (!raw) return null;
+  if (raw == null) return null;
   const s = String(raw)
     .replace(/\s+/g, '')
     .replace(/[’‘‚]/g, "'")
     .replace(/[€$]/g, '')
-    .replace(/(?<=\d)[._](?=\d{3}\b)/g, '')
+    .replace(/(?<=\d)[._](?=\d{3}\b)/g, '') // 1.000 → 1000
     .replace(',', '.');
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
 }
 function expandK(n) {
   if (typeof n !== 'string') return n;
-  const m = n.match(/^([\-+]?\d+(?:[.,]\d+)?)([kK])$/);
+  const m = n.match(/^([\-+]?\d+(?:[.,]\d+)?)[kK]$/);
   if (!m) return n;
   const base = normalizeNumber(m[1]);
   return base != null ? String(base * 1000) : n;
@@ -77,52 +76,77 @@ function computePnlPercent({ side, entry, exit }) {
 function cleanContent(content) {
   return content
     .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`/g, '')
-    .replace(/\*\*/g, '')
-    .replace(/<:[A-Za-z0-9_]+:\d+>/g, '')
-    .replace(/<@!?&?\d+>/g, '')
+    .replace(/`/g, ' ')
+    .replace(/\*\*/g, ' ')
+    .replace(/<:[A-Za-z0-9_]+:\d+>/g, ' ')
+    .replace(/<@!?&?\d+>/g, ' ')
+    .replace(/\n+/g, ' ')
     .trim();
 }
 
-// ========= Parser =========
-const patterns = [
-  /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|in|ingang|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|out|sluit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?(?:lev(?:erage)?|x)\b[:\s]*?(?<lev>[\d.,]+)x?.*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
-  /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
-  /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
-  /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?(?:lev(?:erage)?|x)\s*[:\s]*?(?<lev>[\d.,]+)x?.*?(?:pnl|p&l)\s*[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
-  /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+)/i,
-];
-
+// ========= ULTRA-LENIENT PARSER =========
+// Pakt: PnL% overal; side LONG/SHORT; symbol (BTC, BTCUSDT, SOL, etc.)
+// Entry/Exit na woorden entry/open/in, exit/close/out/sluit
 function parseTrade(msg) {
   const raw = cleanContent(msg.content);
+  if (!raw) return null;
 
-  for (const rx of patterns) {
-    const m = raw.match(rx);
-    if (!m) continue;
-    const g = m.groups || {};
+  // SIDE
+  let side = null;
+  const sideMatch = raw.match(/\b(LONG|SHORT)\b/i);
+  if (sideMatch) side = sideMatch[1].toUpperCase();
 
-    const side = g.side ? g.side.toUpperCase() : null;
-    const symbol = g.symbol ? g.symbol.toUpperCase() : null;
-
-    const entryStr = expandK(g.entry || '');
-    const exitStr  = expandK(g.exit  || '');
-
-    const entry = normalizeNumber(entryStr);
-    const exit  = normalizeNumber(exitStr);
-    const lev   = normalizeNumber(g.lev);
-    let pnl     = normalizeNumber(g.pnl);
-
-    if (pnl == null && side && entry != null && exit != null) {
-      pnl = computePnlPercent({ side, entry, exit });
+  // SYMBOL (neem de eerste plausibele ticker)
+  let symbol = null;
+  // Pak dingen als BTC, ETH, SOL, XRP, ADA, of BTCUSDT/ETHUSD/SOL-PERP etc.
+  const symMatch =
+    raw.match(/\b([A-Z]{2,10})(?:-?PERP|USDT|USD|USDC)?\b/) ||
+    raw.match(/\b[A-Za-z]{2,10}\/[A-Za-z]{2,6}\b/);
+  if (symMatch) {
+    symbol = symMatch[1] ? symMatch[1].toUpperCase() : symMatch[0].toUpperCase();
+    symbol = symbol.replace(/[^A-Z]/g, ''); // haal / of - weg
+    if (symbol.endsWith('USDT') || symbol.endsWith('USD') || symbol.endsWith('USDC')) {
+      symbol = symbol.replace(/USDT|USD|USDC$/, '');
     }
-    if (pnl == null && entry == null && exit == null) continue;
-
-    const guildId = msg.guild?.id || '000000000000000000';
-    const link = `https://discord.com/channels/${guildId}/${msg.channelId}/${msg.id}`;
-
-    return { id: msg.id, link, content: msg.content, side, symbol, entry, exit, lev, pnl, ts: msg.createdTimestamp };
   }
-  return null;
+
+  // ENTRY & EXIT
+  const entryWord = raw.match(/\b(entry|ingang|open|in)\b[:\s-]*([\-+]?[\d.,kK]+)/i);
+  const exitWord  = raw.match(/\b(exit|close|out|sluit)\b[:\s-]*([\-+]?[\d.,kK]+)/i);
+  const entry = entryWord ? normalizeNumber(expandK(entryWord[2])) : null;
+  const exit  = exitWord  ? normalizeNumber(expandK(exitWord[2]))  : null;
+
+  // LEVERAGE
+  const levMatch = raw.match(/(\d+(?:[.,]\d+)?)\s*x\b/i);
+  const lev = levMatch ? normalizeNumber(levMatch[1]) : null;
+
+  // PNL% — voorkeur: na "pnl" of "p&l", anders eerste (of grootste abs) % in de tekst
+  let pnl = null;
+  const pnlAfterLabel = raw.match(/\b(pnl|p&l)\b[^%\-+]*([-+]?[\d.,]+)\s*%/i);
+  if (pnlAfterLabel) {
+    pnl = normalizeNumber(pnlAfterLabel[2]);
+  } else {
+    // verzamel alle %’s en kies de hoogste absolute waarde (meest waarschijnlijk de PnL)
+    const allPercents = [...raw.matchAll(/([-+]?[\d.,]+)\s*%/g)].map(m => normalizeNumber(m[1]));
+    if (allPercents.length > 0) {
+      pnl = allPercents
+        .filter(n => Number.isFinite(n))
+        .sort((a, b) => Math.abs(b) - Math.abs(a))[0];
+    }
+  }
+
+  // Als PnL ontbreekt maar entry/exit+side bekend zijn, bereken hem
+  if ((pnl == null || !Number.isFinite(pnl)) && side && entry != null && exit != null) {
+    pnl = computePnlPercent({ side, entry, exit });
+  }
+
+  // Niks bruikbaars? skip
+  if (pnl == null || !Number.isFinite(pnl)) return null;
+
+  const guildId = msg.guild?.id || '000000000000000000';
+  const link = `https://discord.com/channels/${guildId}/${msg.channelId}/${msg.id}`;
+
+  return { id: msg.id, link, content: msg.content, side, symbol, entry, exit, lev, pnl, ts: msg.createdTimestamp };
 }
 
 // ========= Leaderboard =========
