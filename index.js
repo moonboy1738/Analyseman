@@ -1,7 +1,3 @@
-// index.js
-// Analyseman — Trades + Leaderboards
-// Node 18+, discord.js v14
-
 const cron = require('node-cron');
 const {
   Client,
@@ -11,14 +7,15 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 
-// ====== ENV / IDs ======
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const INPUT_ID      = process.env.INPUT_CHANNEL;       // 🖊️∣-input
-const TRADELOG_ID   = process.env.TRADE_LOG_CHANNEL;   // 📝∣-trade-log
-const LEADER_ID     = process.env.LEADERBOARD_CHANNEL; // 🥇∣-leaderboard
-const TZ            = process.env.TZ || 'Europe/Amsterdam';
+// ====== ENV / KANALEN ======
+const TOKEN = process.env.DISCORD_TOKEN;
+const SERVER_ID = process.env.SERVER_ID;
+const INPUT_ID = process.env.INPUT_CHANNEL;          // 🖊️∣-input
+const TRADE_LOG_ID = process.env.TRADE_LOG_CHANNEL;  // 📝∣-trade-log
+const LEADERBOARD_ID = process.env.LEADERBOARD_CHANNEL; // 🥇∣-leaderboard
+const TZ = process.env.TZ || 'Europe/Amsterdam';
 
-// ====== Client ======
+// ====== CLIENT ======
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -28,288 +25,316 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ====== Utils ======
-const MULT = '\u00D7'; // ×
-
-function usernameExact(msg) {
-  // Gebruik altijd de echte Discord username (geen nickname)
-  // Vb: "moonboy1738"
-  return msg.author?.username || 'Onbekend';
+// ====== HELPERS ======
+function cleanSpaces(s) {
+  return String(s || '').trim().replace(/\s+/g, ' ');
 }
-
+function normalizeNumber(raw) {
+  if (raw == null) return null;
+  const s = String(raw)
+    .trim()
+    .replace(/[€$]/g, '')
+    .replace(/,/g, '.');
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+function fmtUSD(n) {
+  if (n == null || !Number.isFinite(n)) return '$0.00';
+  const v = Number(n);
+  let dp = 2;
+  if (Math.abs(v) < 0.1) dp = 5;   // sub-$0.10 -> 5 decimals
+  return `$${v.toFixed(dp)}`;
+}
+function computePnlPercent(side, entry, exit) {
+  if (!['LONG','SHORT'].includes(side)) return null;
+  if (![entry, exit].every(Number.isFinite)) return null;
+  const raw = ((exit - entry) / entry) * 100;        // GEEN leverage in PnL% (zoals afgesproken)
+  return side === 'SHORT' ? -raw : raw;
+}
 function signPct(p) {
   if (!Number.isFinite(p)) return '0.00%';
   const s = p >= 0 ? '+' : '';
   return `${s}${p.toFixed(2)}%`;
 }
-
-function fmtUSD(n) {
-  if (!Number.isFinite(n)) return '0.00';
-  if (Math.abs(n) >= 1) return n.toFixed(2);
-  return n.toFixed(4);
+function timesSymbol(x) {
+  return `${x}×`;
 }
 
-function parseNumber(s) {
-  if (s == null) return null;
-  const n = Number(String(s).replace(',', '.'));
-  return Number.isFinite(n) ? n : null;
+// We posten naar trade-log in vast tekstformaat (later gebruiken we dat voor parsing)
+function renderTradeMessageRow({ username, pnl, symbol, side, lev, entry, exit }) {
+  return [
+    `${username} ${signPct(pnl)}`,
+    `${symbol.toUpperCase()} ${side} ${timesSymbol(lev)}`,
+    `Entry: ${fmtUSD(entry)}`,
+    `Exit:  ${fmtUSD(exit)}`
+  ].join('\n');
 }
 
-function computePnlPercent(side, entry, exit) {
-  if (![entry, exit].every(Number.isFinite)) return null;
-  const chg = (exit - entry) / entry;
-  return (side.toUpperCase() === 'SHORT' ? -chg : chg) * 100;
+// Parse een door ons geposte trade-log message terug naar data
+const TRADE_PARSE = {
+  first: /^(.+?)\s+([+\-]?\d+(?:\.\d+)?)%$/, // "username +2.20%"
+  second: /^([A-Z0-9]{2,15})\s+(LONG|SHORT)\s+(\d+)×$/, // "PENG LONG 30×"
+  entry: /^Entry:\s+\$([0-9]+(?:\.[0-9]+)?)$/,
+  exit:  /^Exit:\s+\$([0-9]+(?:\.[0-9]+)?)$/
+};
+function tryParsePostedTrade(message) {
+  const lines = message.content.split('\n').map(l => l.trim());
+  if (lines.length < 4) return null;
+
+  const m1 = lines[0].match(TRADE_PARSE.first);
+  const m2 = lines[1].match(TRADE_PARSE.second);
+  const m3 = lines[2].match(TRADE_PARSE.entry);
+  const m4 = lines[3].match(TRADE_PARSE.exit);
+  if (!m1 || !m2 || !m3 || !m4) return null;
+
+  const username = m1[1];
+  const pnl = parseFloat(m1[2]);
+  const symbol = m2[1];
+  const side = m2[2];
+  const lev = parseInt(m2[3], 10);
+  const entry = parseFloat(m3[1]);
+  const exit = parseFloat(m4[1]);
+
+  return {
+    id: message.id,
+    link: `https://discord.com/channels/${message.guildId}/${message.channelId}/${message.id}`,
+    username, pnl, symbol, side, lev, entry, exit,
+    ts: message.createdTimestamp
+  };
 }
 
-// ====== Build trade embed (exact layout) ======
-function buildTradeEmbed({ authorName, pnl, symbol, side, lev, entry, exit }) {
-  const title = `${authorName} ${signPct(pnl)}`;
-  const desc =
-    `${symbol.toUpperCase()} ${side[0].toUpperCase()}${side.slice(1).toLowerCase()} ${lev}${MULT}\n` +
-    `Entry: $${fmtUSD(entry)}\n` +
-    `Exit:  $${fmtUSD(exit)}`;
-
-  return new EmbedBuilder()
-    .setColor(pnl >= 0 ? 0x00c853 : 0xd32f2f)
-    .setTitle(title)
-    .setDescription(desc)
-    // Footer tag zodat we ze later makkelijk kunnen herkennen/parsen
-    .setFooter({ text: '[ANALYSEMAN-TRADE]' })
-    .setTimestamp();
-}
-
-// ====== Parse command: "!trade add SYMBOL SIDE ENTRY EXIT LEVERAGE" ======
-function tryParseTradeAdd(content) {
-  // Voorbeeld: !trade add PENG Long 0.03674 0.03755 30
-  const rx = /^\s*!trade\s+add\s+([A-Za-z0-9._-]+)\s+(long|short)\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)\s*$/i;
-  const m = content.match(rx);
-  if (!m) return null;
-
-  const symbol = m[1];
-  const side   = m[2];
-  const entry  = parseNumber(m[3]);
-  const exit   = parseNumber(m[4]);
-  const lev    = parseNumber(m[5]);
-
-  if (!symbol || !side || !Number.isFinite(entry) || !Number.isFinite(exit) || !Number.isFinite(lev)) {
-    return null;
-  }
-  const pnl = computePnlPercent(side, entry, exit);
-
-  return { symbol, side, entry, exit, lev, pnl };
-}
-
-// ====== Post to trade-log ======
-async function postTradeToLog(trade, sourceMsg) {
-  const tradeLog = await client.channels.fetch(TRADELOG_ID);
-  const authorName = usernameExact(sourceMsg);
-  const embed = buildTradeEmbed({ authorName, ...trade });
-
-  const sent = await tradeLog.send({ embeds: [embed] });
-  return sent;
-}
-
-// ====== Command handler in #input ======
-async function handleMessageInInput(msg) {
-  const parsed = tryParseTradeAdd(msg.content);
-  if (!parsed) {
-    // Foutmelding met exact verwacht patroon
-    await msg.reply({
-      content: 'Ongeldige input. Gebruik: `!trade add SYMBOL SIDE ENTRY EXIT LEVERAGE` (bv. `!trade add PENG Long 0.03674 0.03755 30`).',
-      allowedMentions: { repliedUser: false },
-    });
-    return;
-  }
-
-  // Plaats in trade-log
-  const sent = await postTradeToLog(parsed, msg);
-
-  // Bevestiging in input (compact)
-  const pct = signPct(parsed.pnl);
-  await msg.reply({
-    content: `Trade geregistreerd: **${parsed.symbol.toUpperCase()} ${parsed.side} ${parsed.lev}${MULT}** → ${pct}\nEntry: $${fmtUSD(parsed.entry)} / Exit: $${fmtUSD(parsed.exit)}\n[Trade](${sent.url})`,
-    allowedMentions: { repliedUser: false },
-  });
-}
-
-// ====== Fetch + parse bestaand trade-log voor leaderboards ======
+// Alles (geschiedenis) fetchen uit een kanaal, optioneel cutoff (dagen)
 async function fetchAllMessages(channel, days = null) {
-  const out = [];
+  let out = [];
   let lastId;
   const cutoff = days ? Date.now() - days * 24 * 60 * 60 * 1000 : null;
 
   while (true) {
-    const options = { limit: 100 };
-    if (lastId) options.before = lastId;
-    const batch = await channel.messages.fetch(options);
+    const batch = await channel.messages.fetch({ limit: 100, ...(lastId ? { before: lastId } : {}) });
     if (batch.size === 0) break;
-
-    for (const m of batch.values()) {
-      if (cutoff && m.createdTimestamp < cutoff) return out;
-      out.push(m);
+    for (const msg of batch.values()) {
+      if (cutoff && msg.createdTimestamp < cutoff) return out;
+      out.push(msg);
     }
     lastId = batch.last().id;
   }
   return out;
 }
 
-function parseTradeFromEmbed(msg) {
-  const e = msg.embeds?.[0];
-  if (!e) return null;
-  const footerText = e.footer?.text || '';
-  if (!footerText.includes('[ANALYSEMAN-TRADE]')) return null;
+// ====== COMMAND: !trade add ======
+async function handleTradeAdd(message, args) {
+  // Verwacht: SYMBOL SIDE ENTRY EXIT LEVERAGE
+  // vb: !trade add PENG Long 0.03674 0.03755 30
+  if (args.length < 5) {
+    await message.reply("Ongeldige input. Gebruik: `!trade add SYMBOL SIDE ENTRY EXIT LEVERAGE` (bv. `!trade add PENG Long 0.03674 0.03755 30`).");
+    return;
+  }
+  const [rawSymbol, rawSide, rawEntry, rawExit, rawLev] = args;
 
-  // Title: "<username> +123.45%"  of "<username> -12.34%"
-  const t = e.title || '';
-  const mt = t.match(/^(.+)\s([+\-]?\d+(?:\.\d+)?)%$/);
-  if (!mt) return null;
-  const authorName = mt[1].trim();
-  const pnl = parseNumber(mt[2]);
+  const symbol = cleanSpaces(rawSymbol).toUpperCase();
+  const side = cleanSpaces(rawSide).toUpperCase();
+  const entry = normalizeNumber(rawEntry);
+  const exit  = normalizeNumber(rawExit);
+  const lev   = parseInt(rawLev, 10);
 
-  // Desc:
-  // "PENG Long 35×\nEntry: $0.0367\nExit:  $0.0376"
-  const d = e.description || '';
-  const md = d.match(
-    /^([A-Za-z0-9._-]+)\s+(Long|Short)\s+([0-9.,]+)×\s*[\r\n]+Entry:\s*\$([0-9.,]+)\s*[\r\n]+Exit:\s*\$\s*([0-9.,]+)\s*$/i
-  );
-  if (!md) return null;
+  if (!/^[A-Z0-9]{2,15}$/.test(symbol)) return message.reply("Symbool ongeldig.");
+  if (!['LONG','SHORT'].includes(side)) return message.reply("Side ongeldig. Gebruik LONG of SHORT.");
+  if (!Number.isFinite(entry) || !Number.isFinite(exit)) return message.reply("Entry/Exit ongeldig.");
+  if (!Number.isInteger(lev) || lev <= 0) return message.reply("Leverage ongeldig (geheel getal > 0).");
 
-  const symbol = md[1].toUpperCase();
-  const side   = md[2].toUpperCase();
-  const lev    = parseNumber(md[3]);
-  const entry  = parseNumber(md[4]);
-  const exit   = parseNumber(md[5]);
+  const pnl = computePnlPercent(side, entry, exit);
 
-  return {
-    id: msg.id,
-    link: msg.url,
-    ts: msg.createdTimestamp,
-    authorName,
-    pnl,
-    symbol,
-    side,
-    lev,
-    entry,
-    exit,
-  };
+  // username = echte accountnaam (niet nickname)
+  const username = message.author?.username || 'Onbekend';
+
+  // Naar trade-log posten in vast formaat
+  const tradeLog = await client.channels.fetch(TRADE_LOG_ID);
+  const txt = renderTradeMessageRow({ username, pnl, symbol, side, lev, entry, exit });
+  await tradeLog.send(txt);
+
+  // Feedback in input
+  await message.reply(`Trade geregistreerd: ${symbol} ${side} ${lev}× → ${signPct(pnl)}\nEntry: ${fmtUSD(entry)} / Exit: ${fmtUSD(exit)}\n[Trade](${tradeLog.url || ''})`);
 }
 
-// ====== Leaderboard builders ======
-async function buildLeaderboard({ days = null, topN = 10, wins = true }) {
-  const ch = await client.channels.fetch(TRADELOG_ID);
-  const messages = await fetchAllMessages(ch, days);
-  const trades = messages.map(parseTradeFromEmbed).filter(t => t && Number.isFinite(t.pnl));
-
-  const sorted = trades.sort((a, b) => wins ? (b.pnl - a.pnl) : (a.pnl - b.pnl));
-  const top = sorted.slice(0, topN);
-
-  const rows = top.map((t, i) => {
-    const rank = `${i + 1}.`;
-    const pct  = `${t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}%`;
-    const sideNice = t.side === 'LONG' ? 'Long' : 'Short';
-    return `${rank} ${pct} ${t.symbol} ${sideNice} — by ${t.authorName} — [Trade](${t.link})`;
-  });
-
-  const title = wins
-    ? `Top ${topN} ${days ? 'All-Time winsten (7d niet van toepassing)' : 'All-Time winsten'}`
-    : `Top ${topN} All-Time verliezen`;
-
-  const prettyTitle =
-    days != null
-      ? (wins ? `Top ${topN} winsten (laatste ${days} dagen)` : `Top ${topN} verliezen (laatste ${days} dagen)`)
-      : (wins ? `Top ${topN} All-Time winsten` : `Top ${topN} All-Time verliezen`);
-
-  const embed = new EmbedBuilder()
-    .setColor(wins ? 0x00c853 : 0xd32f2f)
-    .setTitle(prettyTitle)
-    .setDescription(rows.join('\n') || '_Geen geldige trades gevonden._')
-    .setFooter({
-      text: days != null
-        ? (wins ? '[ANALYSEMAN-DAILY]' : '[ANALYSEMAN-DAILY-LOSS]')
-        : (wins ? '[ANALYSEMAN-ALLTIME-WIN]' : '[ANALYSEMAN-ALLTIME-LOSS]'),
-    })
+// ====== LEADERBOARD BOUWERS ======
+function buildTableEmbed({ title, rows, color = 0x00ff88, footer }) {
+  const desc = rows.length ? rows.join('\n') : '_No trades found._';
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(title)
+    .setDescription(desc.slice(0, 3900))
+    .setFooter({ text: footer })
     .setTimestamp();
-
-  return embed;
 }
 
-async function postAndPinLeaderboard(embed, tag) {
-  const lb = await client.channels.fetch(LEADER_ID);
+function fmtRow(rank, t) {
+  const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `${rank}.`;
+  const side = t.side === 'LONG' ? 'LONG' : 'SHORT';
+  return `${medal} ${signPct(t.pnl)} — ${t.symbol} ${side} ${t.lev}× — by **${t.username}** — [Trade](${t.link})`;
+}
+
+async function getParsedTrades(days = null) {
+  const ch = await client.channels.fetch(TRADE_LOG_ID);
+  const msgs = await fetchAllMessages(ch, days);
+  const parsed = msgs
+    .map(m => tryParsePostedTrade(m))
+    .filter(Boolean)
+    .filter(t => Number.isFinite(t.pnl));
+  return parsed;
+}
+
+async function postAndPin(embed, tagText) {
+  const lb = await client.channels.fetch(LEADERBOARD_ID);
   const pins = await lb.messages.fetchPinned().catch(() => null);
-  const old = pins?.find(m => m.embeds?.[0]?.footer?.text === tag);
+  const old = pins?.find(m => m.embeds[0]?.footer?.text === tagText);
   if (old) await old.unpin().catch(() => {});
   const sent = await lb.send({ embeds: [embed] });
   await sent.pin().catch(() => {});
 }
 
-// ====== Scheduled jobs ======
-async function runDailyTop10() {
-  const embed = await buildLeaderboard({ days: 7, topN: 10, wins: true });
-  await postAndPinLeaderboard(embed, '[ANALYSEMAN-DAILY]');
+// TOP N wins of losses
+async function postTop({ title, days, topN, wins }) {
+  const trades = await getParsedTrades(days);
+  if (!trades.length) {
+    const emb = buildTableEmbed({
+      title,
+      rows: [],
+      color: wins ? 0x00ff88 : 0xff4444,
+      footer: wins ? (days ? '[ANALYSEMAN-DAILY-WIN]' : '[ANALYSEMAN-ALLTIME-WIN]')
+                   : (days ? '[ANALYSEMAN-DAILY-LOSS]' : '[ANALYSEMAN-ALLTIME-LOSS]'),
+    });
+    await postAndPin(emb, emb.data.footer.text);
+    return;
+  }
+  const sorted = trades.sort((a, b) => wins ? (b.pnl - a.pnl) : (a.pnl - b.pnl));
+  const pick = sorted.slice(0, topN);
+  const rows = pick.map((t, i) => fmtRow(i + 1, t));
+  const emb = buildTableEmbed({
+    title,
+    rows,
+    color: wins ? 0x00ff88 : 0xff4444,
+    footer: wins ? (days ? '[ANALYSEMAN-DAILY-WIN]' : '[ANALYSEMAN-ALLTIME-WIN]')
+                 : (days ? '[ANALYSEMAN-DAILY-LOSS]' : '[ANALYSEMAN-ALLTIME-LOSS]'),
+  });
+  await postAndPin(emb, emb.data.footer.text);
 }
 
-async function runAllTimeTop25() {
-  const wins = await buildLeaderboard({ days: null, topN: 25, wins: true });
-  const loss = await buildLeaderboard({ days: null, topN: 25, wins: false });
-  await postAndPinLeaderboard(wins, '[ANALYSEMAN-ALLTIME-WIN]');
-  await postAndPinLeaderboard(loss, '[ANALYSEMAN-ALLTIME-LOSS]');
+// TRADER TOTALS (som PnL% per user)
+async function postTotalsAllTime() {
+  const trades = await getParsedTrades(null);
+  const map = new Map();
+  for (const t of trades) {
+    const key = t.username;
+    const cur = map.get(key) || { user: key, sum: 0, n: 0 };
+    cur.sum += t.pnl;
+    cur.n += 1;
+    map.set(key, cur);
+  }
+  const list = [...map.values()].sort((a, b) => b.sum - a.sum);
+  const rows = list.slice(0, 50).map((r, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+    return `${medal} **${r.user}** — ${signPct(r.sum)} (${r.n} trades)`;
+  });
+  const emb = buildTableEmbed({
+    title: 'Trader Totals (All-Time)',
+    rows,
+    color: 0x3399ff,
+    footer: '[ANALYSEMAN-TOTALS]'
+  });
+  await postAndPin(emb, emb.data.footer.text);
 }
 
-// ====== Events ======
+// ====== SCHEDULES ======
+async function runDailyWeeklyTop10() {
+  await postTop({
+    title: 'Top 10 van de week (laatste 7 dagen) — Winsten',
+    days: 7, topN: 10, wins: true
+  });
+}
+async function runAllTime50() {
+  await postTop({ title: 'Top 25 All-Time winsten', days: null, topN: 25, wins: true });
+  await postTop({ title: 'Top 25 All-Time verliezen', days: null, topN: 25, wins: false });
+  await postTotalsAllTime();
+}
+
+// ====== MESSAGE HANDLER ======
+client.on('messageCreate', async (message) => {
+  try {
+    // negeer DM / bots
+    if (!message.guildId || message.author.bot) return;
+
+    // Alleen input-kanaal voor de add-command
+    if (message.channelId === INPUT_ID) {
+      const txt = message.content.trim();
+
+      // !trade add ...
+      if (/^!trade\s+add\b/i.test(txt)) {
+        const args = txt.split(/\s+/).slice(2); // na "!trade add"
+        await handleTradeAdd(message, args);
+        return;
+      }
+
+      // Handmatige triggers (optioneel)
+      if (/^!lb\s+weekly$/i.test(txt)) {
+        await runDailyWeeklyTop10();
+        await message.reply('Weekly top 10 is gepost & gepind.');
+        return;
+      }
+      if (/^!lb\s+alltime$/i.test(txt)) {
+        await runAllTime50();
+        await message.reply('All-Time Top 25 win/loss + Totals zijn gepost & gepind.');
+        return;
+      }
+      if (/^!totals$/i.test(txt)) {
+        await postTotalsAllTime();
+        await message.reply('Trader Totals (All-Time) gepost & gepind.');
+        return;
+      }
+    }
+  } catch (err) {
+    console.error('messageCreate error:', err);
+  }
+});
+
+// ====== READY / PERMS / CRON ======
 client.once('ready', async () => {
   console.log(`[Analyseman] Ingelogd als ${client.user.tag}`);
 
-  // Perm check (nuttig voor debugging)
-  const tradeLog = await client.channels.fetch(TRADELOG_ID);
-  const leaderboard = await client.channels.fetch(LEADER_ID);
-  const me = await leaderboard.guild.members.fetch(client.user.id);
+  // Perms check
+  const guild = await client.guilds.fetch(SERVER_ID);
+  const me = await guild.members.fetch(client.user.id);
 
+  const channels = {
+    input: await client.channels.fetch(INPUT_ID),
+    tlog: await client.channels.fetch(TRADE_LOG_ID),
+    lb: await client.channels.fetch(LEADERBOARD_ID),
+  };
   const need = [
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.ReadMessageHistory,
     PermissionFlagsBits.SendMessages,
     PermissionFlagsBits.EmbedLinks,
-    PermissionFlagsBits.ManageMessages, // voor pin/unpin
+    PermissionFlagsBits.ManageMessages,
   ];
-  const okTrade = need.every(p => tradeLog.permissionsFor(me)?.has(p));
-  const okLB = need.every(p => leaderboard.permissionsFor(me)?.has(p));
-  console.log(`[Analyseman] Perms trade-log OK: ${okTrade}, leaderboard OK: ${okLB}`);
+  const okInput = need.every(p => channels.input.permissionsFor(me)?.has(p));
+  const okTlog  = need.every(p => channels.tlog.permissionsFor(me)?.has(p));
+  const okLB    = need.every(p => channels.lb.permissionsFor(me)?.has(p));
+  console.log(`[Analyseman] Perms OK? input=${okInput} trade-log=${okTlog} leaderboard=${okLB}`);
 
-  // Cron: 09:00 dagelijks — weekly Top 10 (laatste 7 dagen)
+  // Schedules
+  // Dagelijks 09:00: Top 10 weekly (7 dagen)
   cron.schedule('0 9 * * *', async () => {
-    try {
-      console.log('[Analyseman] Daily 09:00 → Top 10 (7d)');
-      await runDailyTop10();
-    } catch (e) {
-      console.error('Daily job error:', e);
-    }
+    console.log('[Analyseman] 09:00 cron → weekly top10');
+    try { await runDailyWeeklyTop10(); } catch (e) { console.error('cron weekly err', e); }
   }, { timezone: TZ });
 
-  // Cron: Zondag 20:00 — All-Time Top 25 wins & losses
+  // Zondag 20:00: All-time win/loss top25 + totals
   cron.schedule('0 20 * * 0', async () => {
-    try {
-      console.log('[Analyseman] Sunday 20:00 → All-Time Top 25 wins & losses');
-      await runAllTimeTop25();
-    } catch (e) {
-      console.error('Weekly job error:', e);
-    }
+    console.log('[Analyseman] Zondag 20:00 cron → all-time + totals');
+    try { await runAllTime50(); } catch (e) { console.error('cron alltime err', e); }
   }, { timezone: TZ });
 
-  console.log('[Analyseman] Cron jobs registered:', TZ);
+  console.log('[Analyseman] Cron jobs set in', TZ);
 });
 
-client.on('messageCreate', async (msg) => {
-  try {
-    if (msg.author.bot) return;
-    if (msg.channelId !== INPUT_ID) return;
-
-    // Alleen in #input luisteren naar !trade add ...
-    if (/^\s*!trade\s+add\b/i.test(msg.content)) {
-      await handleMessageInInput(msg);
-    }
-  } catch (e) {
-    console.error('messageCreate error:', e);
-  }
-});
-
-client.login(DISCORD_TOKEN);
+client.login(TOKEN);
