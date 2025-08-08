@@ -1,3 +1,4 @@
+// ===== Analyseman — volledige bot (CommonJS) =====
 const cron = require('node-cron');
 const {
   Client,
@@ -10,12 +11,13 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 
-// === Kanaal IDs + tijdzone (jouw echte IDs) ===
-const TRADE_LOG_ID = '1395887706755829770';
-const LEADERBOARD_ID = '1395887166890184845';
-const TZ = 'Europe/Amsterdam';
+// ========= Config uit Heroku (met veilige fallbacks) =========
+const TRADE_LOG_ID = process.env.TRADE_LOG_CHANNEL || '1395887706755829770';
+const LEADERBOARD_ID = process.env.LEADERBOARD_CHANNEL || '1395887166890184845';
+const TZ = process.env.TZ || 'Europe/Amsterdam';
+const GUILD_ID = process.env.GUILD_ID || null;
 
-// === Client ===
+// ========= Client =========
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -25,7 +27,7 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ========= Fetch messages helper =========
+// ========= Utilities =========
 async function fetchAllMessages(channel, days = null) {
   let messages = [];
   let lastId;
@@ -47,7 +49,6 @@ async function fetchAllMessages(channel, days = null) {
   return messages;
 }
 
-// ========= Number utils =========
 function normalizeNumber(raw) {
   if (!raw) return null;
   const s = String(raw)
@@ -82,7 +83,7 @@ function cleanContent(content) {
     .trim();
 }
 
-// ========= Meerdere patronen =========
+// ========= Parser =========
 const patterns = [
   /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|in|ingang|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|out|sluit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?(?:lev(?:erage)?|x)\b[:\s]*?(?<lev>[\d.,]+)x?.*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
   /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
@@ -123,6 +124,7 @@ function parseTrade(msg) {
   return null;
 }
 
+// ========= Leaderboard =========
 async function buildLeaderboard(days = 7, topN = 10, wins = true) {
   const channel = await client.channels.fetch(TRADE_LOG_ID);
   const messages = await fetchAllMessages(channel, days);
@@ -174,7 +176,6 @@ async function runWeeklyTop10() {
   const winsEmbed = await buildLeaderboard(7, 10, true);
   await postAndPin(winsEmbed, '[ANALYSEMAN-DAILY]');
 }
-
 async function runAllTimeTop50() {
   const winsEmbed = await buildLeaderboard(null, 50, true);
   const lossesEmbed = await buildLeaderboard(null, 50, false);
@@ -182,6 +183,7 @@ async function runAllTimeTop50() {
   await postAndPin(lossesEmbed, '[ANALYSEMAN-ALLTIME-LOSS]');
 }
 
+// ========= Ready =========
 client.once('ready', async () => {
   console.log(`[Analyseman] Ingelogd als ${client.user.tag}`);
 
@@ -189,9 +191,6 @@ client.once('ready', async () => {
   const leaderboard = await client.channels.fetch(LEADERBOARD_ID);
 
   const me = await leaderboard.guild.members.fetch(client.user.id);
-  const permsTrade = tradeLog.permissionsFor(me);
-  const permsLB = leaderboard.permissionsFor(me);
-
   const need = [
     PermissionFlagsBits.ViewChannel,
     PermissionFlagsBits.ReadMessageHistory,
@@ -199,11 +198,11 @@ client.once('ready', async () => {
     PermissionFlagsBits.EmbedLinks,
     PermissionFlagsBits.ManageMessages,
   ];
-
-  const okTrade = need.every(p => permsTrade?.has(p));
-  const okLB = need.every(p => permsLB?.has(p));
+  const okTrade = need.every(p => tradeLog.permissionsFor(me)?.has(p));
+  const okLB = need.every(p => leaderboard.permissionsFor(me)?.has(p));
   console.log(`[Analyseman] Perms trade-log OK: ${okTrade}, leaderboard OK: ${okLB}`);
 
+  // Cron
   cron.schedule('0 9 * * *', async () => {
     console.log('[Analyseman] Trigger: daily weekly top10 (09:00 Europe/Amsterdam)');
     try { await runWeeklyTop10(); console.log('[Analyseman] Daily top10 posted.'); }
@@ -218,6 +217,7 @@ client.once('ready', async () => {
 
   console.log('[Analyseman] Cron jobs registered with timezone:', TZ);
 
+  // Slash-commands: GUILD (direct zichtbaar) → anders GLOBAL (kan ~1u duren)
   try {
     const commands = [
       new SlashCommandBuilder().setName('lb_daily').setDescription('Post de Top 10 van de week (nu)'),
@@ -225,13 +225,24 @@ client.once('ready', async () => {
     ].map(c => c.toJSON());
 
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log('[Analyseman] Slash commands: /lb_daily, /lb_alltime geregistreerd');
+
+    if (GUILD_ID) {
+      await rest.put(
+        Routes.applicationGuildCommands(client.user.id, GUILD_ID),
+        { body: commands }
+      );
+      console.log('[Analyseman] Slash commands geregistreerd voor guild:', GUILD_ID);
+    } else {
+      console.warn('[Analyseman] Geen GUILD_ID gezet; registreer GLOBAL (kan ~1u duren).');
+      await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+      console.log('[Analyseman] Slash commands GLOBAL geregistreerd');
+    }
   } catch (e) {
     console.error('[Analyseman] Slash command deploy error:', e);
   }
 });
 
+// ========= Interactions =========
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
@@ -248,5 +259,5 @@ client.on('interactionCreate', async (i) => {
   }
 });
 
-// === Start bot ===
+// ========= Start =========
 client.login(process.env.DISCORD_TOKEN);
