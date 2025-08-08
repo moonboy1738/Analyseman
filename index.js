@@ -1,4 +1,4 @@
-// index.js — Analyseman (alles-in-één, behoudt bestaand trade-log formaat)
+// index.js — Analyseman (prefix + slash, behoudt trade-log layout)
 
 const cron = require('node-cron');
 const {
@@ -12,13 +12,14 @@ const {
   PermissionFlagsBits,
 } = require('discord.js');
 
-// ====== KANAAL-IDS (jouw echte) ======
+// ====== JOUW KANALEN (blijven zo) ======
 const INPUT_CHANNEL_ID      = '1397658460211908801'; // 🖊️-input
 const TRADE_LOG_ID          = '1395887706755829770'; // 📝-trade-log
 const LEADERBOARD_ID        = '1395887166890184845'; // 🥇-leaderboard
 const TZ = 'Europe/Amsterdam';
+const PREFIX = '!'; // prefix voor tekstcommando
 
-// ====== DISCORD CLIENT ======
+// ====== CLIENT ======
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -39,7 +40,6 @@ async function fetchAllMessages(channel, days = null) {
     if (lastId) options.before = lastId;
     const fetched = await channel.messages.fetch(options);
     if (fetched.size === 0) break;
-
     for (const msg of fetched.values()) {
       if (cutoff && msg.createdTimestamp < cutoff) return out;
       out.push(msg);
@@ -55,8 +55,8 @@ function normalizeNumber(raw) {
     .replace(/\s+/g, '')
     .replace(/[’‘‚]/g, "'")
     .replace(/[€$]/g, '')
-    .replace(/(?<=\d)[._](?=\d{3}\b)/g, '') // strip thousand sep .,_
-    .replace(',', '.');                     // decimal comma -> dot
+    .replace(/(?<=\d)[._](?=\d{3}\b)/g, '')
+    .replace(',', '.');
   const n = parseFloat(s);
   return Number.isFinite(n) ? n : null;
 }
@@ -83,7 +83,7 @@ function cleanContent(content) {
     .trim();
 }
 
-// Parser die je bestaande layout en varianten aankan
+// Parser van bestaande logs
 const patterns = [
   /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|in|ingang|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|out|sluit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?(?:lev(?:erage)?|x)\b[:\s]*?(?<lev>[\d.,]+)x?.*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
   /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+).*?\b(?:pnl|p&l)\b[:\s]*?(?<pnl>[-+]?[\d.,]+)\s*%/i,
@@ -92,9 +92,8 @@ const patterns = [
   /(?:(?<symbol>[A-Z]{2,15}))?.*?\b(?<side>LONG|SHORT)\b.*?\b(?:entry|open)\b[:\s]*?(?<entry>[-+]?[\d.,kK]+).*?\b(?:exit|close)\b[:\s]*?(?<exit>[-+]?[\d.,kK]+)/i,
 ];
 
-function parseTrade(msg) {
+function parseTradeFromMsg(msg) {
   const raw = cleanContent(msg.content);
-
   for (const rx of patterns) {
     const m = raw.match(rx);
     if (!m) continue;
@@ -104,7 +103,6 @@ function parseTrade(msg) {
     const symbol = g.symbol ? g.symbol.toUpperCase() : null;
     const entryStr = expandK(g.entry || '');
     const exitStr  = expandK(g.exit  || '');
-
     const entry = normalizeNumber(entryStr);
     const exit  = normalizeNumber(exitStr);
     const lev   = normalizeNumber(g.lev);
@@ -129,14 +127,13 @@ function parseTrade(msg) {
   return null;
 }
 
-// ====== LEADERBOARDS ======
 const fmtUser = (u) => u || 'Onbekend';
 const fmtSide = (s) => (s ? (s === 'LONG' ? '🟩 LONG' : '🟥 SHORT') : '');
 
 async function buildLeaderboard(days = 7, topN = 10, wins = true) {
   const ch = await client.channels.fetch(TRADE_LOG_ID);
   const msgs = await fetchAllMessages(ch, days);
-  const trades = msgs.map(parseTrade).filter(t => t && Number.isFinite(t.pnl));
+  const trades = msgs.map(parseTradeFromMsg).filter(t => t && Number.isFinite(t.pnl));
 
   const sorted = trades.sort((a, b) => wins ? b.pnl - a.pnl : a.pnl - b.pnl);
   const top = sorted.slice(0, topN);
@@ -167,7 +164,7 @@ async function buildLeaderboard(days = 7, topN = 10, wins = true) {
 async function buildTraderTotals(topN = 25) {
   const ch = await client.channels.fetch(TRADE_LOG_ID);
   const msgs = await fetchAllMessages(ch, null);
-  const trades = msgs.map(parseTrade).filter(t => t && Number.isFinite(t.pnl));
+  const trades = msgs.map(parseTradeFromMsg).filter(t => t && Number.isFinite(t.pnl));
 
   const map = new Map();
   for (const t of trades) {
@@ -221,7 +218,7 @@ async function runTotals() {
   await postAndPin(t, '[ANALYSEMAN-TOTALS]');
 }
 
-// ====== /trade formatting (exact jouw layout) ======
+// ====== TRADE-LOG LAYOUT ======
 function fmtMoney(n) {
   if (n == null) return null;
   return `$${Number(n).toFixed(2)}`;
@@ -232,27 +229,62 @@ function fmtPct(n) {
   return (n >= 0 ? `+${s}` : s);
 }
 function buildTradeLogText({ trader, symbol, side, lev, entry, exit, pnl }) {
-  // Regels exact zoals jouw screenshot:
-  // Regel 1: <trader>  <+/-xx.xx%>  (pnl badge visueel door %, we zetten textueel erbij)
-  // Regel 2: SYMBOL SIDE <lev>x
-  // Regel 3: Entry: $...
-  // Regel 4: Exit:  $...
-  const l1 = pnl != null
-    ? `${trader} — ${fmtPct(pnl)}`
-    : `${trader}`;
+  const l1 = pnl != null ? `${trader} — ${fmtPct(pnl)}` : `${trader}`;
   const levStr = lev ? ` ${lev}x` : '';
   const l2 = `${symbol || ''} ${side || ''}${levStr}`.trim();
   const l3 = entry != null ? `Entry: ${fmtMoney(entry)}` : null;
   const l4 = exit  != null ? `Exit: ${fmtMoney(exit)}`  : null;
-
   return [l1, l2, l3, l4].filter(Boolean).join('\n');
 }
 
-// ====== BOT READY ======
+// ====== Centrale handler voor zowel slash als prefix ======
+async function handleTradePost({ guild, channelId, user, member, symbol, side, leverage, entry, exit, pnl }) {
+  const trader = member?.displayName || user?.globalName || user?.username || 'Onbekend';
+
+  // PnL berekenen indien nodig
+  let usePnl = pnl;
+  if (usePnl == null && entry != null && exit != null) {
+    usePnl = computePnlPercent({ side, entry, exit });
+  }
+
+  // Bevestiging in INPUT
+  const pct = (v) => (v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`);
+  const levStr = leverage ? ` ${leverage}x` : '';
+  const entryStr = entry != null ? `\nEntry: ${fmtMoney(entry)}` : '';
+  const exitStr  = exit  != null ? `\nExit: ${fmtMoney(exit)}`  : '';
+  const pnlStr   = usePnl   != null ? ` → ${pct(usePnl)}`      : '';
+  const confirm  = `Trade geregistreerd: **${symbol} ${side}${levStr}**${pnlStr}${entryStr}${exitStr}`;
+
+  try {
+    const inputCh = await client.channels.fetch(INPUT_CHANNEL_ID);
+    await inputCh.send(confirm);
+  } catch (e) { /* ignore */ }
+
+  // Post in TRADE LOG in exact layout
+  const tradeLogText = buildTradeLogText({
+    trader,
+    symbol,
+    side,
+    lev: leverage || null,
+    entry,
+    exit,
+    pnl: usePnl
+  });
+
+  try {
+    const logCh = await client.channels.fetch(TRADE_LOG_ID);
+    await logCh.send(tradeLogText);
+  } catch (e) {
+    console.error('Trade log post error:', e);
+    throw e;
+  }
+}
+
+// ====== READY ======
 client.once('ready', async () => {
   console.log(`[Analyseman] Ingelogd als ${client.user.tag}`);
 
-  // slash commands registeren
+  // Slash commands GUILD-scoped (direct zichtbaar)
   const commands = [
     new SlashCommandBuilder()
       .setName('trade')
@@ -273,8 +305,12 @@ client.once('ready', async () => {
 
   try {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-    console.log('[Analyseman] Slash commands geregistreerd.');
+    const guildId = process.env.SERVER_ID;
+    await rest.put(
+      Routes.applicationGuildCommands(client.user.id, guildId),
+      { body: commands }
+    );
+    console.log('[Analyseman] Slash commands GUILD-SCOPED geregistreerd voor', guildId);
   } catch (e) {
     console.error('Slash command deploy error:', e);
   }
@@ -289,58 +325,39 @@ client.once('ready', async () => {
   }, { timezone: TZ });
 });
 
-// ====== INTERACTIONS ======
+// ====== SLASH INTERACTIONS ======
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
+  // Alleen in input-kanaal
+  if (i.channelId !== INPUT_CHANNEL_ID && i.commandName === 'trade') {
+    try { await i.reply({ content: '❌ Gebruik dit in het 🖊️-input kanaal.', ephemeral: true }); } catch {}
+    return;
+  }
+
   if (i.commandName === 'trade') {
     try { await i.deferReply({ ephemeral: true }); } catch {}
-
-    // Alleen in #input toestaan
-    if (i.channelId !== INPUT_CHANNEL_ID) {
-      try { await i.editReply('❌ Gebruik dit commando in het 🖊️-input kanaal.'); } catch {}
-      return;
-    }
-
-    const symbol  = i.options.getString('symbol').toUpperCase();
-    const side    = i.options.getString('side').toUpperCase();
-    const lev     = i.options.getInteger('leverage') || null;
-    const entry   = i.options.getNumber('entry');
-    const exit    = i.options.getNumber('exit');
-    let pnl       = i.options.getNumber('pnl');
-
-    // Bereken PnL% indien niet meegegeven maar entry/exit wel
-    if (pnl == null && entry != null && exit != null) {
-      pnl = computePnlPercent({ side, entry, exit });
-    }
-
-    const trader = i.member?.displayName || i.user.username;
-
-    // Bevestiging in INPUT
-    const pct = (v) => (v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`);
-    const levStr = lev ? ` ${lev}x` : '';
-    const entryStr = entry != null ? `\nEntry: ${fmtMoney(entry)}` : '';
-    const exitStr  = exit  != null ? `\nExit: ${fmtMoney(exit)}`  : '';
-    const pnlStr   = pnl   != null ? ` → ${pct(pnl)}`            : '';
-    const confirm  = `Trade geregistreerd: **${symbol} ${side}${levStr}**${pnlStr}${entryStr}${exitStr}`;
+    const symbol   = i.options.getString('symbol').toUpperCase();
+    const side     = i.options.getString('side').toUpperCase();
+    const leverage = i.options.getInteger('leverage') || null;
+    const entry    = i.options.getNumber('entry');
+    const exit     = i.options.getNumber('exit');
+    const pnl      = i.options.getNumber('pnl');
 
     try {
-      const inputCh = await client.channels.fetch(INPUT_CHANNEL_ID);
-      await inputCh.send(confirm);
-    } catch (e) { /* ignore */ }
-
-    // Post in TRADE LOG in exact jouw format
-    const tradeLogText = buildTradeLogText({ trader, symbol, side, lev, entry, exit, pnl });
-    try {
-      const logCh = await client.channels.fetch(TRADE_LOG_ID);
-      await logCh.send(tradeLogText);
+      await handleTradePost({
+        guild: i.guild,
+        channelId: i.channelId,
+        user: i.user,
+        member: i.member,
+        symbol, side, leverage,
+        entry, exit, pnl
+      });
+      await i.editReply('✅ Trade geregistreerd.');
     } catch (e) {
-      console.error('Trade log post error:', e);
-      try { await i.editReply('❌ Fout bij posten in trade-log.'); } catch {}
-      return;
+      console.error(e);
+      try { await i.editReply('❌ Fout bij registreren.'); } catch {}
     }
-
-    try { await i.editReply('✅ Trade geregistreerd.'); } catch {}
   }
 
   if (i.commandName === 'lb_daily') {
@@ -359,6 +376,75 @@ client.on('interactionCreate', async (i) => {
     try { await i.deferReply({ ephemeral: true }); } catch {}
     try { await runTotals(); await i.editReply('✅ Trader Totals gepost.'); }
     catch (e) { console.error(e); try { await i.editReply('❌ Fout bij posten.'); } catch {} }
+  }
+});
+
+// ====== PREFIX COMMAND (!trade) ======
+client.on('messageCreate', async (message) => {
+  if (message.author.bot) return;
+  if (message.channel.id !== INPUT_CHANNEL_ID) return;
+  if (!message.content.startsWith(PREFIX)) return;
+
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift()?.toLowerCase();
+
+  if (cmd !== 'trade') return;
+
+  // Toegestane vormen:
+  // !trade BTC LONG 25x 60000 61200  (leverage optioneel, 'x' mag)
+  // !trade BTC LONG 25 60000 61200
+  // !trade BTC LONG 60000 61200      (zonder leverage)
+  // !trade BTC SHORT 25 60000 59000 12.5  (pnl optioneel, anders berekend)
+
+  if (args.length < 3) {
+    return message.reply('Gebruik: `!trade SYMBOL SIDE [LEVERAGE] ENTRY EXIT [PNL%]` (bv. `!trade BTC LONG 25x 60000 61200`)');
+  }
+
+  const symbol = args.shift().toUpperCase();
+  const side = args.shift().toUpperCase();
+
+  // detecteer leverage (met of zonder x) of direct entry
+  let leverage = null, entry = null, exit = null, pnl = null;
+
+  // volgende token
+  let t1 = args.shift();
+  if (!t1) return message.reply('Ontbrekende waarden. Gebruik: `!trade SYMBOL SIDE [LEVERAGE] ENTRY EXIT [PNL%]`.');
+
+  const levMatch = String(t1).toLowerCase().endsWith('x') ? t1.slice(0, -1) : null;
+  const maybeLev = levMatch != null ? levMatch : t1;
+
+  if (!isNaN(Number(maybeLev)) && args.length >= 2) {
+    // t1 is leverage
+    leverage = parseInt(maybeLev, 10);
+    entry = normalizeNumber(args.shift());
+    exit  = normalizeNumber(args.shift());
+  } else {
+    // t1 is entry
+    entry = normalizeNumber(t1);
+    exit  = normalizeNumber(args.shift());
+  }
+
+  // Optionele pnl
+  if (args.length) {
+    pnl = normalizeNumber(args.shift());
+  }
+
+  if (!symbol || !['LONG','SHORT'].includes(side) || entry == null || exit == null) {
+    return message.reply('Ongeldige input. Gebruik: `!trade SYMBOL SIDE [LEVERAGE] ENTRY EXIT [PNL%]`');
+  }
+
+  try {
+    await handleTradePost({
+      guild: message.guild,
+      channelId: message.channel.id,
+      user: message.author,
+      member: message.member,
+      symbol, side, leverage, entry, exit, pnl
+    });
+    // geen extra reply nodig: bot stuurt al bevestiging in input
+  } catch (e) {
+    console.error(e);
+    message.reply('❌ Fout bij registreren.');
   }
 });
 
