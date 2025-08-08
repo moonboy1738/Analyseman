@@ -1,4 +1,7 @@
-// ===== Analyseman — FINAL: pakt trader uit embeds/mentions, unicode mintekens, 50 entries, strakke lijst =====
+// ===== Analyseman — FINAL FINAL =====
+// Trader uit alle embed-delen, PnL uit alle embed-delen, unicode minus, Entry/Exit fallback,
+// nooit entries droppen op naam → altijd Top 50, strakke 1-regel output.
+
 const cron = require('node-cron');
 const {
   Client, GatewayIntentBits, Partials, EmbedBuilder,
@@ -20,88 +23,160 @@ const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
 const clamp=(n,min,max)=>Math.max(min,Math.min(max,n));
 const pad=(n,len)=>String(n).padStart(len,'0');
 
-// normalize number with comma/dot and thousands separators
 function normalizeNumber(raw){
   if(raw==null) return null;
-  const s=String(raw)
+  const s = String(raw)
     .replace(/\s+/g,'')
     .replace(/[’‘‚]/g,"'")
     .replace(/[€$]/g,'')
     .replace(/(?<=\d)[._](?=\d{3}\b)/g,'') // 1.000 -> 1000
     .replace(',', '.');
-  const n=parseFloat(s);
-  return Number.isFinite(n)?n:null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
 }
 function expandK(n){
   if(typeof n!=='string') return n;
-  const m=n.match(/^([\-+\u2212\u2013]?\d+(?:[.,]\d+)?)[kK]$/); // supports − (U+2212) and – (U+2013)
+  const m = n.match(/^([+\-\u2212\u2013]?\d+(?:[.,]\d+)?)[kK]$/);
   if(!m) return n;
-  const base=normalizeNumber(m[1]);
-  return base!=null?String(base*1000):n;
+  const base = normalizeNumber(m[1]);
+  return base!=null ? String(base*1000) : n;
 }
 function computePnlPercent({side,entry,exit}){
   if(![entry,exit].every(Number.isFinite)) return null;
-  const ch=(exit-entry)/entry;
-  const dir=side?.toUpperCase()==='SHORT'?-ch:ch;
+  const ch = (exit-entry)/entry;
+  const dir = side?.toUpperCase()==='SHORT' ? -ch : ch;
   return dir*100;
 }
 
-// merge text from content + embed parts
-function extractText(msg){
-  let t = msg.content || '';
-  for(const e of msg.embeds||[]){
-    if(e.author?.name) t += ' ' + e.author.name;   // trader + pnl vaak hier
-    if(e.title) t += ' ' + e.title;
-    if(e.description) t += ' ' + e.description;
-    for(const f of e.fields||[]) if(f?.value) t += ' ' + f.value;
-    if(e.footer?.text) t += ' ' + e.footer.text;
+// Gather ALL text from the message & embeds
+function extractAllTextParts(msg){
+  const parts = [];
+  if (msg.content) parts.push(msg.content);
+  for (const e of msg.embeds || []) {
+    if (e.author?.name) parts.push(e.author.name);
+    if (e.title) parts.push(e.title);
+    if (e.description) parts.push(e.description);
+    if (Array.isArray(e.fields)) {
+      for (const f of e.fields) {
+        if (f?.name) parts.push(f.name);
+        if (f?.value) parts.push(f.value);
+      }
+    }
+    if (e.footer?.text) parts.push(e.footer.text);
   }
-  return t
-    .replace(/```[\s\S]*?```/g,' ')
-    .replace(/`/g,' ')
-    .replace(/\*\*/g,' ')
-    .replace(/<:[A-Za-z0-9_]+:\d+>/g,' ')
-    .replace(/\n+/g,' ')
-    .trim();
+  return parts
+    .filter(Boolean)
+    .map(t=>t.replace(/```[\s\S]*?```/g,' ')
+             .replace(/`/g,' ')
+             .replace(/\*\*/g,' ')
+             .replace(/<:[A-Za-z0-9_]+:\d+>/g,' ')
+             .replace(/\n+/g,' ')
+             .trim())
+    .join(' ');
 }
 
-// ---------- trader name detection ----------
+// ---------- strong field extractors ----------
+// Pull Entry/Exit specifically from any part (fields, desc, etc.)
+function findEntryExit(allText){
+  // Try "Entry: $123" / "Exit: 123.45" (case-insensitive)
+  const eM = allText.match(/\bentry\b\s*[:\-]?\s*([+\-\u2212\u2013]?\$?[\d.,kK]+)/i);
+  const xM = allText.match(/\b(exit|close|sluit)\b\s*[:\-]?\s*([+\-\u2212\u2013]?\$?[\d.,kK]+)/i);
+  const entry = eM ? normalizeNumber(expandK(eM[1])) : null;
+  const exit  = xM ? normalizeNumber(expandK(xM[2])) : null;
+  return { entry, exit };
+}
+
+function findSide(allText){
+  const m = allText.match(/\b(LONG|SHORT)\b/i);
+  return m ? m[1].toUpperCase() : null;
+}
+function findLev(allText){
+  const m = allText.match(/(\d+(?:[.,]\d+)?)\s*x\b/i);
+  return m ? normalizeNumber(m[1]) : null;
+}
+function findSymbol(allText){
+  // BTC, ETH, SOL, BTCUSDT, ETH/USD, etc.
+  const m = allText.match(/\b([A-Z]{2,12})(?:-?PERP|USDT|USD|USDC)?\b/) || allText.match(/\b([A-Z]{2,12})\/[A-Z]{2,6}\b/);
+  if (!m) return null;
+  return (m[1]||m[0]).toUpperCase().replace(/[^A-Z]/g,'').replace(/(USDT|USD|USDC)$/,'');
+}
+
+// Try to find a single percentage anywhere (supports +, -, −, –)
+function findAnyPercent(allText){
+  const matches = [...allText.matchAll(/([+\-\u2212\u2013]?[\d.,]+)\s*%/g)]
+    .map(m=>normalizeNumber(m[1]))
+    .filter(Number.isFinite);
+  // If there are many, don't trust it; return null and use compute or labeled paths
+  if (matches.length===1) return matches[0];
+  return null;
+}
+
+// Prefer PnL from labels or embed author if present
+function findLabeledPnl(msg){
+  // check author name for % first
+  for (const e of msg.embeds || []) {
+    const n = e?.author?.name;
+    if (n){
+      const m = n.match(/([+\-\u2212\u2013]?[\d.,]+)\s*%/);
+      if (m) {
+        const v = normalizeNumber(m[1]);
+        if (Number.isFinite(v) && Math.abs(v)<=5000) return v;
+      }
+    }
+  }
+  // labeled words near %
+  const t = extractAllTextParts(msg);
+  const m = t.match(/\b(pnl|p&l|roi|return)\b[^%+\-\u2212\u2013]*([+\-\u2212\u2013]?[\d.,]+)\s*%/i);
+  if (m){
+    const v = normalizeNumber(m[2]);
+    if (Number.isFinite(v) && Math.abs(v)<=5000) return v;
+  }
+  return null;
+}
+
+// detect Trader name from multiple places
 async function detectTraderName(msg){
-  // 1) first mentioned user
+  // 1) first mention → displayName
   const mUser = msg.mentions?.users?.first();
   if (mUser) {
     const mem = await msg.guild.members.fetch(mUser.id).catch(()=>null);
     return mem?.displayName || mUser.globalName || mUser.username || 'Onbekend';
   }
 
-  // 2) embed author "name" like "mellabr −100.08%"
-  const embAuthor = msg.embeds?.find(e=>e?.author?.name)?.author?.name;
-  if (embAuthor) {
-    // take text before the percentage, supports +, -, −, –
-    const m = embAuthor.match(/^(.+?)\s+[+\-\u2212\u2013]?[\d.,]+\s*%/);
-    if (m) return m[1].trim();
-    // if no %, maybe it's just the name
-    if (!embAuthor.match(/%/)) return embAuthor.trim();
+  // 2) embed author name (might be "mellabr −100.08%")
+  for (const e of msg.embeds || []) {
+    const n = e?.author?.name;
+    if (n){
+      const m = n.match(/^(.+?)\s+[+\-\u2212\u2013]?[\d.,]+\s*%/);
+      if (m) return m[1].trim();
+      if (!n.includes('%')) return n.trim();
+    }
   }
 
-  const raw = extractText(msg);
+  // 3) embed footer
+  for (const e of msg.embeds || []) {
+    const f = e?.footer?.text;
+    if (f && f.length>=2 && f.length<=64) return f.trim();
+  }
 
-  // 3) "by <name>" / "door <name>"
-  const by = raw.match(/\b(by|door)\s+([A-Za-z0-9_.\- ]{2,32})\b/i);
+  const t = extractAllTextParts(msg);
+
+  // 4) "by <name>" / "door <name>"
+  const by = t.match(/\b(by|door)\s+([A-Za-z0-9_.\- ]{2,32})\b/i);
   if (by) return by[2].trim();
 
-  // 4) mention id like <@123>
-  const idm = raw.match(/<@!?(\d+)>/);
+  // 5) mention id present in text
+  const idm = t.match(/<@!?(\d+)>/);
   if (idm) {
     const u = await msg.guild.members.fetch(idm[1]).catch(()=>null);
     if (u) return u.displayName || u.user?.globalName || u.user?.username || 'Onbekend';
   }
 
-  // 5) plain @name
-  const at = raw.match(/@([A-Za-z0-9_.\-]{2,32})/);
+  // 6) plain @name token
+  const at = t.match(/@([A-Za-z0-9_.\-]{2,32})/);
   if (at) return at[1];
 
-  // 6) if author is human, use it
+  // 7) fallback: human author
   if (!msg.author?.bot) {
     const m = await msg.guild.members.fetch(msg.author.id).catch(()=>null);
     return m?.displayName || msg.author.globalName || msg.author.username || 'Onbekend';
@@ -109,7 +184,7 @@ async function detectTraderName(msg){
   return 'Onbekend';
 }
 
-// ---------- fetch messages (rate-limit friendly) ----------
+// ---------- fetch all messages ----------
 async function fetchAllMessages(channel, days=null){
   const out=[]; let lastId; const cutoff = days ? Date.now()-days*86400000 : null;
   while(true){
@@ -126,85 +201,56 @@ async function fetchAllMessages(channel, days=null){
   return out;
 }
 
-// ---------- extract % ----------
-function extractPnl(raw, msg, side, entry, exit){
-  // A) prefer embed.author.name percent (supports +, -, −, –)
-  const aName = msg.embeds?.find(e=>e?.author?.name)?.author?.name;
-  if (aName){
-    const m = aName.match(/([+\-\u2212\u2013]?[\d.,]+)\s*%/);
-    if (m){ const v=normalizeNumber(m[1]); if (Number.isFinite(v) && Math.abs(v)<=5000) return v; }
-  }
-
-  // B) labeled PnL in text
-  const labeled = raw.match(/\b(pnl|p&l|roi|return)\b[^%+\-\u2212\u2013]*([+\-\u2212\u2013]?[\d.,]+)\s*%/i);
-  if (labeled) {
-    const v = normalizeNumber(labeled[2]);
-    if (Number.isFinite(v) && Math.abs(v)<=5000) return v;
-  }
-
-  // C) compute from entry/exit if possible
-  if (side && entry!=null && exit!=null) {
-    const v = computePnlPercent({side,entry,exit});
-    if (Number.isFinite(v) && Math.abs(v)<=5000) return v;
-  }
-
-  // D) fallback: exactly one percentage in combined text (supports unicode minus)
-  const all = [...raw.matchAll(/([+\-\u2212\u2013]?[\d.,]+)\s*%/g)]
-    .map(m=>normalizeNumber(m[1]))
-    .filter(Number.isFinite);
-  if (all.length===1 && Math.abs(all[0])<=5000) return all[0];
-
-  return null;
-}
-
-// ---------- parse core fields ----------
-function parseStruct(raw){
-  const side = raw.match(/\b(LONG|SHORT)\b/i)?.[1]?.toUpperCase() || null;
-
-  // symbol guess: BTC, ETH, SOL, BTCUSDT, ETH/USD etc. (strip common suffix)
-  let symbol=null;
-  const sym = raw.match(/\b([A-Z]{2,12})(?:-?PERP|USDT|USD|USDC)?\b/) || raw.match(/\b([A-Z]{2,12})\/[A-Z]{2,6}\b/);
-  if (sym) symbol=(sym[1]||sym[0]).toUpperCase().replace(/[^A-Z]/g,'').replace(/(USDT|USD|USDC)$/,'');
-
-  const entry = normalizeNumber(expandK(raw.match(/\b(entry|ingang|open|in)\b[:\s-]*([\-+\u2212\u2013]?\d+(?:[.,]\d+)?[kK]?)/i)?.[2]));
-  const exit  = normalizeNumber(expandK(raw.match(/\b(exit|close|out|sluit)\b[:\s-]*([\-+\u2212\u2013]?\d+(?:[.,]\d+)?[kK]?)/i)?.[2]));
-  const lev   = normalizeNumber(raw.match(/(\d+(?:[.,]\d+)?)\s*x\b/i)?.[1]);
-  return { side, symbol, entry, exit, lev };
-}
-
+// ---------- parse trade ----------
 async function parseTrade(msg){
-  const raw = extractText(msg);
-  if (!raw) return null;
+  const allText = extractAllTextParts(msg);
+  if (!allText) return null;
 
-  const base = parseStruct(raw);
-  const pnl = extractPnl(raw, msg, base.side, base.entry, base.exit);
+  const side = findSide(allText);
+  const { entry, exit } = findEntryExit(allText);
+  const lev = findLev(allText);
+  const symbol = findSymbol(allText);
+
+  // PnL priority: labeled → author → single % → compute → (else null)
+  let pnl = findLabeledPnl(msg);
+  if (pnl==null) {
+    const one = findAnyPercent(allText);
+    if (one!=null) pnl = one;
+  }
+  if (pnl==null) {
+    const comp = computePnlPercent({ side, entry, exit });
+    if (comp!=null) pnl = comp;
+  }
   if (pnl==null || !Number.isFinite(pnl)) return null;
+  pnl = clamp(pnl, -5000, 5000);
 
   const trader = await detectTraderName(msg);
   const guildId = msg.guild?.id || '000000000000000000';
   const link = `https://discord.com/channels/${guildId}/${msg.channelId}/${msg.id}`;
-
-  return { ...base, pnl: clamp(pnl,-5000,5000), trader, link, ts: msg.createdTimestamp };
+  return { pnl, side, entry, exit, lev, symbol, trader, link, ts: msg.createdTimestamp };
 }
 
-// ---------- formatting (clean, 1 regel per trade) ----------
+// ---------- formatting ----------
 function medal(i){ return i===0?'🥇':i===1?'🥈':i===2?'🥉':`${pad(i+1,2)}.`; }
 function line(i,t){
   const pnl = `${t.pnl>=0?'+':''}${t.pnl.toFixed(2)}%`;
   const sym = t.symbol || '—';
   const side = t.side || '—';
   const lev = t.lev ? `${t.lev}x` : '—';
-  return `${medal(i)}  ${pnl}  ${sym}  ${side}  ${lev}  by ${t.trader} — [Trade](${t.link})`;
+  const who = t.trader || 'Onbekend';
+  return `${medal(i)}  ${pnl}  ${sym}  ${side}  ${lev}  by ${who} — [Trade](${t.link})`;
 }
 
 async function buildLeaderboard(days=7, topN=10, wins=true){
   const ch = await client.channels.fetch(TRADE_LOG_ID);
   const msgs = await fetchAllMessages(ch, days);
+
   const trades=[];
   for(const m of msgs){
-    const t=await parseTrade(m);
-    if(t) trades.push(t);
+    const t = await parseTrade(m);
+    if (t) trades.push(t);
   }
+
   const sorted = trades.sort((a,b)=> wins ? b.pnl-a.pnl : a.pnl-b.pnl);
   const top = sorted.slice(0, topN);
   const desc = top.length ? top.map((t,i)=>line(i,t)).join('\n').slice(0,3900) : '_Geen geldige trades gevonden._';
@@ -250,21 +296,20 @@ client.once('ready', async ()=>{
   console.log(`[Analyseman] Perms trade-log OK: ${okTrade}, leaderboard OK: ${okLB}`);
 
   cron.schedule('0 9 * * *', async ()=>{
-    console.log('[Analyseman] Trigger daily 09:00');
     try { await runWeeklyTop10(); } catch(e){ console.error('Daily job error:', e); }
   }, { timezone: TZ });
 
   cron.schedule('0 20 * * 0', async ()=>{
-    console.log('[Analyseman] Trigger all-time 20:00 Sunday');
     try { await runAllTimeTop50(); } catch(e){ console.error('Weekly job error:', e); }
   }, { timezone: TZ });
 
   try{
-    const cmds=[ new SlashCommandBuilder().setName('lb_daily').setDescription('Post de Top 10 van de week (nu)'),
-                 new SlashCommandBuilder().setName('lb_alltime').setDescription('Post de Top 50 all-time wins & losses (nu)') ]
-                 .map(c=>c.toJSON());
-    const rest=new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
-    if(GUILD_ID){
+    const cmds = [
+      new SlashCommandBuilder().setName('lb_daily').setDescription('Post de Top 10 van de week (nu)'),
+      new SlashCommandBuilder().setName('lb_alltime').setDescription('Post de Top 50 all-time wins & losses (nu)')
+    ].map(c=>c.toJSON());
+    const rest = new REST({version:'10'}).setToken(process.env.DISCORD_TOKEN);
+    if (GUILD_ID) {
       await rest.put(Routes.applicationGuildCommands(client.user.id, GUILD_ID), { body: cmds });
       console.log('[Analyseman] Slash commands geregistreerd voor guild:', GUILD_ID);
     } else {
@@ -274,7 +319,7 @@ client.once('ready', async ()=>{
   } catch(e){ console.error('[Analyseman] Slash cmd deploy error:', e); }
 });
 
-// ---------- interactions (async reply) ----------
+// ---------- interactions ----------
 client.on('interactionCreate', async (i)=>{
   if(!i.isChatInputCommand()) return;
 
