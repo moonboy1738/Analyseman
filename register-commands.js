@@ -1,34 +1,50 @@
-// Registers slash commands to your guild
-import 'dotenv/config';
-import { REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { REST, Routes } from 'discord.js';
+import fs from 'fs';
+import path from 'path';
 
-const {
-  DISCORD_TOKEN,
-  CLIENT_ID,      // your bot application id
-  GUILD_ID        // your server id
-} = process.env;
+// Haalt variabelen rechtstreeks uit Heroku Config Vars
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const TOKEN = process.env.TOKEN;
 
-if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error('Missing DISCORD_TOKEN / CLIENT_ID / GUILD_ID env vars');
-  process.exit(1);
+// Controleer of alle vereiste vars aanwezig zijn
+if (!CLIENT_ID || !GUILD_ID || !TOKEN) {
+    console.error('❌ Missing CLIENT_ID, GUILD_ID, or TOKEN in environment variables.');
+    process.exit(1);
 }
 
-const commands = [
-  new SlashCommandBuilder().setName('lb_alltime').setDescription('Post Top 25 All-Time (wins & losses)'),
-  new SlashCommandBuilder().setName('lb_weekly').setDescription('Post Top 10 van de laatste 7 dagen'),
-  new SlashCommandBuilder().setName('totals').setDescription('Post totale +/- PnL % per persoon (best→worst)')
-].map(c => c.toJSON());
+// Commands inladen vanuit de /commands map (pas aan als jouw map anders heet)
+const commands = [];
+const commandsPath = path.join(process.cwd(), 'commands');
+const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
 
-const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-
-try {
-  console.log('Registering slash commands...');
-  await rest.put(
-    Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-    { body: commands }
-  );
-  console.log('Slash commands geregistreerd ✅');
-} catch (err) {
-  console.error(err);
-  process.exit(1);
+for (const file of commandFiles) {
+    const filePath = path.join(commandsPath, file);
+    const command = await import(`file://${filePath}`);
+    if (command.data && command.data.toJSON) {
+        commands.push(command.data.toJSON());
+    } else {
+        console.warn(`⚠️ Skipped ${file} - geen geldige command structuur`);
+    }
 }
+
+// REST client maken
+const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+// Deployen naar Discord
+(async () => {
+    try {
+        console.log(`🔄 Started refreshing ${commands.length} application (/) commands...`);
+
+        const data = await rest.put(
+            Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+            { body: commands },
+        );
+
+        console.log(`✅ Successfully reloaded ${data.length} application (/) commands.`);
+        process.exit(0);
+    } catch (error) {
+        console.error(error);
+        process.exit(1);
+    }
+})();
