@@ -1,17 +1,16 @@
 {
-  "name": "analyseman-tradebot",
+  "name": "analyeseman-tradebot",
   "version": "2.0.0",
-  "type": "module",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node index.js",
+    "register": "node register-commands.js"
   },
   "dependencies": {
+    "dayjs": "^1.11.13",
     "discord.js": "^14.15.3",
-    "dotenv": "^16.4.5",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "tz-offset": "^0.0.1"
   }
 }
