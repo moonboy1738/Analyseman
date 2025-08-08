@@ -1,2 +1,1 @@
-worker: python discord_trade_leaderboard_bot.py
-
+worker: node index.js
