@@ -1,4 +1,4 @@
-// index.js — Analyesman (ultra-robust slash ACK, exact PnL from trade-log, Trade links, embed-budget safe)
+// index.js — Analyesman (ephemeral ACK + kanaalpost, exact PnL uit trade-log, Trade links, embed-budget safe)
 
 import {
   Client,
@@ -114,8 +114,6 @@ function formatValueWithInputPrecision(raw) {
 // Parse regex (exact jouw format in #📝-trade-log)
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
 const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
-// const ENTRY_RE     = /Entry:\s+\$([0-9]*\.?[0-9]+)/i;
-// const EXIT_RE      = /Exit:\s+\$([0-9]*\.?[0-9]+)/i;
 
 const TRADE_REGEX =
   /^!trade\s+add\s+([A-Za-z0-9._/-]+)\s+(long|short)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)?\s+([0-9]{1,4})\s*$/i;
@@ -221,7 +219,7 @@ async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 10000 
       if (out.length >= max) break;
     }
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 80)); // even ademhalen tegen rate limit
+    await new Promise(r => setTimeout(r, 80));
   }
   return out;
 }
@@ -324,28 +322,7 @@ function buildWeeklyEmbed(rows) {
   return renderWithBudget(rows, "📈 Top 10 Weekly Trades (laatste 7 dagen)", 10, budget);
 }
 
-// ---------- robust interaction helpers ----------
-async function safeReply(i, payload) {
-  try { await i.reply(payload); return true; }
-  catch (e) {
-    console.warn("reply failed, try defer:", e?.code || e?.message || e);
-    try { await i.deferReply({ ephemeral: false }); await i.editReply(payload); return true; }
-    catch (e2) { console.error("reply+defer failed:", e2); return false; }
-  }
-}
-async function safeEdit(i, payload) {
-  try { await i.editReply(payload); return true; }
-  catch (e) {
-    console.warn("editReply failed, fallback to channel:", e?.code || e?.message || e);
-    try {
-      const ch = await client.channels.fetch(i.channelId);
-      await ch.send(payload); // altijd nog resultaat in kanaal
-    } catch (e2) { console.error("fallback send failed:", e2); }
-    return false;
-  }
-}
-
-// ------------- RUNTIME -------------
+// ------------ STARTUP ------------
 client.on("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   setTimeout(() => {
@@ -353,7 +330,7 @@ client.on("ready", async () => {
   }, 15000);
 });
 
-// ====== /input & /trade-log handling — NIET AANRAKEN ======
+// ====== INPUT & TRADE-LOG — NIET AANPASSEN ======
 client.on("messageCreate", async (msg) => {
   try {
     if (msg.author.bot) return;
@@ -403,45 +380,65 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ---- Slash commands (instant ACK + later edit; altijd resultaat) ----
+// ---------- helper voor kanaalpost ----------
+async function safeChannelSend(channelId, payload) {
+  try {
+    const ch = await client.channels.fetch(channelId);
+    return await ch.send(payload);
+  } catch (e) {
+    console.error("safeChannelSend error:", e?.code || e?.message || e);
+    throw e;
+  }
+}
+
+// ---- Slash commands (NOOIT time-out): direct ephemeral ACK, daarna kanaalpost ----
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
+  console.log("Slash ontvangen:", i.commandName, "in", i.channelId);
 
-  // 1) DIRECTE ACK binnen < 200ms
-  const ackOk = await safeReply(i, { content: "Bezig met verzamelen…", ephemeral: false });
-  if (!ackOk) {
-    // als dit faalt is er iets mis met rechten of verbinding; we kunnen niets meer doen
-    return;
+  // 1) Onmiddellijk ACK'en — ephemeral kost geen kanaal-permissies
+  try {
+    await i.reply({ content: "Bezig met verzamelen…", ephemeral: true });
+  } catch (e) {
+    try { await i.deferReply({ ephemeral: true }); }
+    catch (e2) { console.error("Kon niet ACK'en:", e2); return; }
   }
 
-  // 2) Werklast uitvoeren en het bericht bijwerken
+  // 2) Data uit #📝-trade-log ophalen en als los bericht in #🏆-leaderboard posten
   try {
     if (i.commandName === "lb_alltime") {
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
       if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
-        await safeEdit(i, { content: "Geen trades gevonden in #📝-trade-log." });
+        await i.editReply("Geen trades gevonden in #📝-trade-log.");
         return;
       }
       const embeds = buildAllTimeEmbeds(best, worst, totals);
-      await safeEdit(i, { content: "", embeds });
+      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds });
+      await i.editReply("Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
     }
 
     if (i.commandName === "lb_daily") {
       const weekly = await getWeeklyTopFromLog(10);
       if (!weekly?.length) {
-        await safeEdit(i, { content: "Geen trades gevonden in de laatste 7 dagen." });
+        await i.editReply("Geen trades gevonden in de laatste 7 dagen.");
         return;
       }
       const eb = buildWeeklyEmbed(weekly);
-      await safeEdit(i, { content: "", embeds: [eb] });
+      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb] });
+      await i.editReply("Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
     }
 
-    await safeEdit(i, { content: "Onbekende command." });
+    await i.editReply("Onbekende command.");
   } catch (err) {
     console.error("interaction error:", err);
-    await safeEdit(i, { content: `Er ging iets mis tijdens het opbouwen van de lijst. ${err?.message ?? ""}` });
+    try {
+      await safeChannelSend(LEADERBOARD_CHANNEL_ID, {
+        content: `Er ging iets mis bij het opbouwen van de lijst: ${err?.message ?? err}`,
+      });
+    } catch {}
+    await i.editReply("Er ging iets mis bij het opbouwen van de lijst.");
   }
 });
 
@@ -538,6 +535,5 @@ function setupCrons() {
   }
 })();
 
-// ---- Global guards voor rare crashes ----
 process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
 process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
