@@ -68,7 +68,7 @@ async function ensureDb() {
     );
   `);
 
-  // 2) Migraties: voeg ontbrekende kolommen toe (idempotent, inclusief pnl_percent)
+  // 2) Migraties (idempotent, incl. pnl_percent)
   await pool.query(`
     ALTER TABLE trades
       ADD COLUMN IF NOT EXISTS user_id TEXT,
@@ -118,7 +118,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers, // handig voor naam->ID lookup bij backfill
+    GatewayIntentBits.GuildMembers, // handig voor latere lookups
   ],
   partials: [Partials.Channel, Partials.Message],
 });
@@ -386,32 +386,40 @@ client.on("interactionCreate", async (i) => {
           try {
             const pf = new PermissionsBitField(i.member?.permissions);
             return pf.has(PermissionsBitField.Flags.ManageGuild);
-          } catch {
-            return false;
-          }
+          } catch { return false; }
         })();
-
         if (!hasManage) {
           await i.reply({ content: "Je hebt geen toestemming voor /backfill.", ephemeral: true });
           return;
         }
 
-        // reageer binnen 3s en draai daarna
+        // reageer binnen 3s
         await i.deferReply({ ephemeral: true });
+        await i.editReply("Backfill gestart… (0 verwerkt)");
 
-        const { processed, skipped, errors } = await runBackfillVerbose();
+        // run met limit + progress callback
+        const LIMIT = 1200; // ruim boven jouw ~1000 berichten
+        const { processed, skipped, errors } = await runBackfillVerbose({
+          limit: LIMIT,
+          onProgress: async (state) => {
+            try {
+              await i.editReply(
+                `Backfill bezig… verwerkt: ${state.processed}, overgeslagen: ${state.skipped} (tot nu toe)`
+              );
+            } catch {}
+          },
+        });
 
         let msg = `Backfill klaar. Verwerkt: ${processed}, overgeslagen: ${skipped}.`;
         if (errors.length) {
           msg += `\nFouten (${errors.length}):\n` + errors.slice(0,5).map(e => `• ${e}`).join("\n");
           if (errors.length > 5) msg += `\n(+${errors.length - 5} extra)`;
         }
-
-        await i.editReply({ content: msg });
+        await i.editReply(msg);
       } catch (e) {
         console.error("BACKFILL FATAL:", e);
         if (i.deferred || i.replied) {
-          await i.editReply({ content: `Backfill faalde: ${e?.message || e}` });
+          await i.editReply(`Backfill faalde: ${e?.message || e}`);
         } else {
           await i.reply({ content: `Backfill faalde: ${e?.message || e}`, ephemeral: true });
         }
@@ -423,18 +431,24 @@ client.on("interactionCreate", async (i) => {
   }
 });
 
-// ------------- BACKFILL (robuust + logging) -------------
+// ------------- BACKFILL (sneller + progress + limiet) -------------
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-]?\d+(?:\.\d{1,2})?%)`/m;
 const BODY_REGEX = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})×\s*[\r\n]+Entry:\s+\$([0-9]*\.?[0-9]+)(?:[\r\n]+Exit:\s+\$([0-9]*\.?[0-9]+))?/m;
 
-async function runBackfillVerbose() {
+async function runBackfillVerbose(opts = {}) {
+  const limit = typeof opts.limit === "number" ? opts.limit : 1200;
+  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
+
   const channel = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   let lastId = null;
   let processed = 0;
   let skipped = 0;
   const errors = [];
+  let seen = 0;
 
   while (true) {
+    if (seen >= limit) break;
+
     let batch;
     try {
       batch = await channel.messages.fetch({ limit: 100, before: lastId ?? undefined });
@@ -442,12 +456,16 @@ async function runBackfillVerbose() {
       errors.push(`messages.fetch failed: ${e?.message || e}`);
       break;
     }
-    if (batch.size === 0) break;
+    if (!batch || batch.size === 0) break;
 
     const msgs = Array.from(batch.values());
     for (const m of msgs) {
+      if (seen >= limit) break;
+      seen++;
+
       try {
         if (!m.author.bot) { skipped++; continue; }
+
         const content = m.content ?? "";
         const h = content.match(HEADER_REGEX);
         const b = content.match(BODY_REGEX);
@@ -456,28 +474,23 @@ async function runBackfillVerbose() {
         const usernameText = h[1].trim();
         if (EXCLUDE_USERNAMES.includes(usernameText.toLowerCase())) { skipped++; continue; }
 
-        const exist = await pool.query(`SELECT 1 FROM trades WHERE trade_log_message_id=$1`, [m.id]);
+        const exist = await pool.query(
+          `SELECT 1 FROM trades WHERE trade_log_message_id=$1`,
+          [m.id]
+        );
         if (exist.rowCount > 0) { skipped++; continue; }
 
-        const pnlText = h[2].replace("%","");
+        const pnlText = h[2].replace("%", "");
         const symbol = b[1].toUpperCase();
         const side = b[2];
-        const lev = parseInt(b[3],10);
+        const lev = parseInt(b[3], 10);
         const entryRaw = b[4];
         const exitRaw = b[5] || null;
 
-        // Probeer member-ID te vinden (fallback op name:<lowercase>)
-        let userId = `name:${usernameText.toLowerCase()}`;
-        try {
-          const members = await m.guild.members.fetch({ query: usernameText, limit: 1 });
-          const cand = members.find(mm =>
-            mm.displayName.toLowerCase() === usernameText.toLowerCase() ||
-            mm.user.username.toLowerCase() === usernameText.toLowerCase()
-          );
-          if (cand) userId = cand.id;
-        } catch {}
+        // snelle user_id zonder live member fetch
+        const userId = `name:${usernameText.toLowerCase()}`;
 
-        // PnL
+        // PnL (herbereken als exit aanwezig, anders uit pill)
         let pnl = 0;
         if (exitRaw) {
           const entry = Number(entryRaw);
@@ -499,20 +512,24 @@ async function runBackfillVerbose() {
           entry_num: isNaN(Number(entryRaw)) ? null : Number(entryRaw),
           exit_num: exitRaw && !isNaN(Number(exitRaw)) ? Number(exitRaw) : null,
           pnl_percent: Number(pnl.toFixed(6)),
-          input_message_id: m.id,          // geen input-id bekend; gebruik message id
+          input_message_id: m.id,          // geen input-id; gebruik message id
           trade_log_message_id: m.id,
           channel_id: TRADE_LOG_CHANNEL_ID,
         });
 
         processed++;
       } catch (e) {
-        console.error(`Backfill error on message ${m.id}:`, e);
-        errors.push(`msg ${m.id}: ${e?.message || e}`);
+        console.error(`Backfill error on message ${m?.id}:`, e);
+        errors.push(`msg ${m?.id}: ${e?.message || e}`);
       }
     }
 
+    if (onProgress) {
+      try { await onProgress({ processed, skipped }); } catch {}
+    }
+
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 500)); // throttle tegen ratelimits
+    await new Promise(r => setTimeout(r, 300)); // lichte throttle
   }
 
   return { processed, skipped, errors };
