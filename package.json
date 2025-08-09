@@ -1,15 +1,15 @@
 {
-  "name": "analysman-bot",
+  "name": "analyseman",
   "version": "1.0.0",
-  "description": "Discord trade bot + leaderboards",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "register": "node register-commands.js"
+    "deploy-commands": "node register-commands.js"
   },
   "dependencies": {
     "discord.js": "^14.15.3",
+    "pg": "^8.11.5",
     "node-cron": "^3.0.3"
   }
 }
