@@ -1,4 +1,4 @@
-// index.js — Analyesman (final: robust ACK for /lb_alltime; input/trade-log & /lb_daily unchanged)
+// index.js — Analyesman (final: ultra-robust ACK for /lb_alltime; input/trade-log & /lb_daily unchanged)
 
 import {
   Client,
@@ -63,6 +63,7 @@ async function ensureDb() {
     );
   `);
 
+  // legacy kolommen tolerant
   const relaxLegacy = async (col) => {
     const r = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name=$1`,
@@ -170,7 +171,6 @@ async function insertTrade(row) {
 // ----------------- DATA UIT #trade-log -----------------
 const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\u2212","-"));
 
-// PnL *exact* uit de pill; geen herberekening
 function parseTradeFromMessage(m) {
   const content = m.content ?? "";
   const h = content.match(HEADER_REGEX);
@@ -386,22 +386,24 @@ async function safeChannelSend(channelId, payload) {
   }
 }
 
-// ---- Slash commands (robust ACK for lb_alltime) ----
+// ---- Slash commands (ULTRA-ROBUST ACK) ----
 function isAcked(i) {
   return i.deferred || i.replied;
 }
 async function ack(i) {
   if (isAcked(i)) return true;
+  // 1) Probeer DIRECTE reply (ephemeral) — snelste ACK
   try {
-    await i.deferReply({ ephemeral: true });
+    await i.reply({ content: "Bezig…", ephemeral: true });
     return true;
-  } catch (e) {
-    console.error("ACK (deferReply) failed:", e?.code, e?.message || e);
+  } catch (e1) {
+    console.error("ACK (reply) failed:", e1?.code, e1?.message || e1);
+    // 2) Fallback: defer
     try {
-      await i.reply({ content: "Bezig…", ephemeral: true });
+      await i.deferReply({ ephemeral: true });
       return true;
     } catch (e2) {
-      console.error("ACK (reply) also failed:", e2?.code, e2?.message || e2);
+      console.error("ACK (deferReply) also failed:", e2?.code, e2?.message || e2);
       return false;
     }
   }
@@ -412,6 +414,9 @@ async function finish(i, content) {
       await i.editReply(content);
     } else if (!i.replied) {
       await i.reply({ content, ephemeral: true });
+    } else {
+      // we replied al — update het bericht
+      await i.editReply?.(content).catch(() => {});
     }
   } catch (e) {
     console.error("finish() error:", e?.code, e?.message || e);
@@ -423,7 +428,7 @@ client.on("interactionCreate", async (i) => {
   console.log("Slash ontvangen:", i.commandName, "in", i.channelId);
 
   const ok = await ack(i);
-  if (!ok) return;
+  if (!ok) return; // zonder ACK geen vervolg
 
   try {
     if (i.commandName === "lb_alltime") {
