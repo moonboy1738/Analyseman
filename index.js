@@ -36,7 +36,7 @@ const EXCLUDE_USERNAMES = [
   "jordanbelfort",
 ];
 
-// ------------ DB (storage voor archief; LB leest uit trade-log) ------------
+// ------------ DB (storage voor archief; leaderboards lezen uit trade-log) ------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -81,6 +81,7 @@ async function ensureDb() {
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
 
+  // legacy kolommen permissief
   const relaxLegacy = async (col) => {
     const r = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name=$1`,
@@ -220,14 +221,13 @@ function parseTradeFromMessage(m) {
     side,
     leverage_x: lev,
     pnl_percent: safeNum(pnl),
-  // link + tijd:
     trade_log_message_id: m.id,
     created_at: m.createdAt
   };
 }
 
-// Efficiënt scannen met korte tijdslimiet + harde limiet
-async function scanTradesFromLog({ days = null, max = 4000, timeLimitMs = 12000 } = {}) {
+// Efficiënt scannen met tijdslimiet + harde limiet
+async function scanTradesFromLog({ days = null, max = 4000, timeLimitMs = 15000 } = {}) {
   const ch = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   const out = [];
   let lastId = null;
@@ -251,14 +251,12 @@ async function scanTradesFromLog({ days = null, max = 4000, timeLimitMs = 12000 
       if (out.length >= max) break;
     }
     lastId = msgs[msgs.length - 1].id;
-    // mini-throttle
     await new Promise(r => setTimeout(r, 120));
   }
   return out;
 }
 
 async function getAllTimeFromLog(limitBest = 25, limitWorst = 25) {
-  // scan met ruime tijdslimiet maar niet oneindig
   const trades = await scanTradesFromLog({ days: null, max: 4000, timeLimitMs: 15000 });
 
   const best = [...trades].sort((a,b) => b.pnl_percent - a.pnl_percent).slice(0, limitBest);
@@ -288,7 +286,6 @@ async function getWeeklyTopFromLog(limit = 10) {
 // ----------------- RENDER (Trade link + veilige lengtes) -----------------
 const EMBED_MAX = 4096;
 const LINE_MAX = 180;
-
 const trim = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
 function renderBestWorstLines(rows) {
@@ -297,7 +294,7 @@ function renderBestWorstLines(rows) {
     const tag = medal(idx);
     const user = `**${r.username}**`;
     const item = `${r.symbol.toUpperCase()} ${r.side}`;
-    const lev = `${r.leverage_x}x`;
+    const lev = `${r.leverage_x}x`; // in leaderboard 'x' (zoals screenshot)
     const pnl = pnlBadge(r.pnl_percent);
     const link = r.trade_log_message_id
       ? `  ${tradeLink(GUILD_ID, TRADE_LOG_CHANNEL_ID, r.trade_log_message_id)}`
@@ -317,6 +314,7 @@ function renderBestWorstLines(rows) {
 
 function renderTotalsLines(rows) {
   if (!rows || rows.length === 0) return ["Geen resultaten."];
+
   const lines = rows.map((r, idx) => {
     const tag = medal(idx);
     const user = `**${r.username}**`;
@@ -394,12 +392,13 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ---- Slash commands (altijd direct defer + duidelijke fouten) ----
+// ---- Slash commands (altijd direct defer + duidelijke debug/fouten) ----
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
 
+  const fail = async (msg) => { try { await i.editReply(msg); } catch {} };
+
   try {
-    // ALTIJD binnen 3s deferen
     await i.deferReply({ ephemeral: false });
   } catch (e) {
     console.error("deferReply failed:", e);
@@ -409,10 +408,18 @@ client.on("interactionCreate", async (i) => {
 
   try {
     if (i.commandName === "lb_alltime") {
-      // status update (handig bij grote kanalen)
       try { await i.editReply("Bezig met verzamelen…"); } catch {}
 
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
+      console.log("[LB_ALLTIME]",
+        "best:", best?.length ?? 0,
+        "worst:", worst?.length ?? 0,
+        "totals:", totals?.length ?? 0
+      );
+
+      if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
+        return fail("Geen trades gevonden in #📝-trade-log (parser vond 0 items).");
+      }
 
       const eb1 = new EmbedBuilder()
         .setColor(0x111827)
@@ -437,6 +444,9 @@ client.on("interactionCreate", async (i) => {
       try { await i.editReply("Bezig met verzamelen…"); } catch {}
 
       const weekly = await getWeeklyTopFromLog(10);
+      console.log("[LB_DAILY]", "weekly:", weekly?.length ?? 0);
+
+      if (!weekly?.length) return fail("Geen trades gevonden in de laatste 7 dagen.");
 
       const eb = new EmbedBuilder()
         .setColor(0x111827)
@@ -447,11 +457,11 @@ client.on("interactionCreate", async (i) => {
       return;
     }
 
-    // fallback
     await i.editReply("Onbekende command.");
   } catch (err) {
     console.error("interaction error:", err);
-    try { await i.editReply("Er ging iets mis tijdens het opbouwen van de lijst."); } catch {}
+    const brief = (err && err.message) ? `Fout: ${err.message}` : "Onbekende fout.";
+    try { await i.editReply(`Er ging iets mis tijdens het opbouwen van de lijst. ${brief}`); } catch {}
   }
 });
 
