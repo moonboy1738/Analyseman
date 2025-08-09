@@ -1,4 +1,4 @@
-// index.js — Analyesman (ephemeral ACK + kanaalpost, exact PnL uit trade-log, Trade links overal, budget safe)
+// index.js — Analyesman (final: stable deferReply, Trade links overal, budget-safe; input & trade-log ongewijzigd)
 
 import {
   Client,
@@ -170,7 +170,7 @@ async function insertTrade(row) {
 // ----------------- DATA UIT #trade-log -----------------
 const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\u2212","-"));
 
-// Belangrijk: PnL *exact* uit de pill; geen herberekening
+// PnL *exact* uit de pill; geen herberekening
 function parseTradeFromMessage(m) {
   const content = m.content ?? "";
   const h = content.match(HEADER_REGEX);
@@ -219,7 +219,7 @@ async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 10000 
       if (out.length >= max) break;
     }
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 80)); // adem tegen rate limit
+    await new Promise(r => setTimeout(r, 80));
   }
   return out;
 }
@@ -252,10 +252,10 @@ async function getWeeklyTopFromLog(limit = 10) {
 }
 
 // ----------------- RENDER + BUDGETEER -----------------
-const EMBED_DESC_MAX = 4096;          // per embed
-const MESSAGE_EMBEDS_BUDGET = 6000;   // totaal per bericht
+const EMBED_DESC_MAX = 4096;
+const MESSAGE_EMBEDS_BUDGET = 6000;
 
-// NIET trims op regelniveau meer → links blijven heel
+// GEEN per-regel trim → links blijven heel
 function buildLine(r, idx, withLink = true) {
   const tag = medal(idx);
   const user = `**${r.username}**`;
@@ -268,7 +268,7 @@ function buildLine(r, idx, withLink = true) {
   return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
 }
 
-// budgetteer: eventueel dwing links af; reduceer dan aantal regels, maar trim geen links
+// budgetteer: links eventueel afdwingen; reduceer eerst aantal regels; trim niet midden in link
 function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, options = {}) {
   const { forceLinks = false } = options;
   const useRows = rows.slice(0, preferredCount);
@@ -289,7 +289,6 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, optio
 
     if (withLink && !forceLinks) { withLink = false; continue; }
     if (count > 1) { count = Math.max(1, Math.floor(count * 0.95)); continue; }
-    // laatste redmiddel: hard cap (maar zonder link-vernietiging)
     description = description.slice(0, Math.min(EMBED_DESC_MAX, Math.max(0, budgetForThisEmbed - title.length - 10)));
     break;
   }
@@ -303,7 +302,6 @@ function buildAllTimeEmbeds(best, worst, totals) {
   const wBudget = Math.floor(totalBudget * 0.45);
   const tBudget = Math.floor(totalBudget * 0.10);
 
-  // LINKS verplicht voor top 25
   const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget, { forceLinks: true });
   const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget, { forceLinks: true });
 
@@ -390,20 +388,22 @@ async function safeChannelSend(channelId, payload) {
   }
 }
 
-// ---- Slash commands (NOOIT time-out): direct ephemeral ACK, daarna kanaalpost ----
+// ---- Slash commands: ALTIJD eerst deferReply (ephemeral), daarna kanaalpost ----
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
   console.log("Slash ontvangen:", i.commandName, "in", i.channelId);
 
-  // 1) Onmiddellijk ACK'en — ephemeral kost geen kanaal-permissies
+  // 1) Onmiddellijke ACK — voorkomt “application did not respond”
   try {
-    await i.reply({ content: "Bezig met verzamelen…", ephemeral: true });
+    if (!i.deferred && !i.replied) {
+      await i.deferReply({ ephemeral: true });
+    }
   } catch (e) {
-    try { await i.deferReply({ ephemeral: true }); }
-    catch (e2) { console.error("Kon niet ACK'en:", e2); return; }
+    console.error("Kon niet deferReply'en:", e);
+    return; // zonder ACK kun je niet verder; voorkom 15s fout
   }
 
-  // 2) Data uit #📝-trade-log ophalen
+  // 2) Data uit #📝-trade-log ophalen en posten
   try {
     if (i.commandName === "lb_alltime") {
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
@@ -411,9 +411,10 @@ client.on("interactionCreate", async (i) => {
         await i.editReply("Geen trades gevonden in #📝-trade-log.");
         return;
       }
+
       const [eb1, eb2, eb3] = buildAllTimeEmbeds(best, worst, totals);
 
-      // Post in twee berichten om 6000-budget te garanderen — mét (Trade) links
+      // twee losse berichten ivm 6000-budget — met (Trade) links
       await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb1] });
       await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb2, eb3] });
 
@@ -441,7 +442,7 @@ client.on("interactionCreate", async (i) => {
         content: `Er ging iets mis bij het opbouwen van de lijst: ${err?.message ?? err}`,
       });
     } catch {}
-    await i.editReply("Er ging iets mis bij het opbouwen van de lijst.");
+    try { await i.editReply("Er ging iets mis bij het opbouwen van de lijst."); } catch {}
   }
 });
 
