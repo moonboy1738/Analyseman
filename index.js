@@ -1,4 +1,4 @@
-// index.js — Analyesman (Heroku safe, auto-history + LB from trade-log, embed budget)
+// index.js — Analyesman (LB leest exact uit trade-log; vaste "Trade"-link; embed-budget safe)
 
 import {
   Client,
@@ -113,7 +113,7 @@ const client = new Client({
 
 // ====== HELPERS (input/trade-log blijven EXACT) ======
 const medal = (i) => (i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`);
-const tradeLink = (gid, cid, mid) => `[Trade](https://discord.com/channels/${gid}/${cid}/${mid})`; // korter
+const tradeLink = (gid, cid, mid) => `[(Trade)](https://discord.com/channels/${gid}/${cid}/${mid})`;
 const pnlBadge = (pnl) => {
   const v = Number(pnl);
   const s = isFinite(v) ? (v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`) : "NaN%";
@@ -129,7 +129,7 @@ function formatValueWithInputPrecision(raw) {
   return `$${s}`;
 }
 
-// Parse regex
+// Parse regex (exact jouw format)
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
 const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
 const ENTRY_RE     = /Entry:\s+\$([0-9]*\.?[0-9]+)/i;
@@ -188,9 +188,9 @@ async function insertTrade(row) {
 }
 
 // ----------------- DATA UIT #trade-log -----------------
-const safeNum = (x) => (Number.isFinite(x) ? x : 0);
 const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\u2212","-"));
 
+// Belangrijk: we nemen PnL *exact* uit de pill in de header; geen herberekening
 function parseTradeFromMessage(m) {
   const content = m.content ?? "";
   const h = content.match(HEADER_REGEX);
@@ -203,23 +203,19 @@ function parseTradeFromMessage(m) {
   const side = b[2];
   const lev = parseInt(b[3], 10);
 
-  const e = content.match(ENTRY_RE);
-  const x = content.match(EXIT_RE);
-  const entry = e ? Number(e[1]) : null;
-  const exit  = x ? Number(x[1]) : null;
+  // we lezen entry/exit puur voor eventuele toekomstige checks, NIET voor berekening
+  // (oude berichten kunnen minder decimalen tonen)
+  // const e = content.match(ENTRY_RE);
+  // const x = content.match(EXIT_RE);
 
-  let pnl = parsePnlNumber(pill);
-  if (entry != null && exit != null && entry > 0) {
-    const dir = side === "Long" ? 1 : -1;
-    pnl = ((exit - entry) / entry) * 100 * dir * Math.max(1, lev);
-  }
+  const pnl = parsePnlNumber(pill);
 
   return {
     username,
     symbol,
     side,
     leverage_x: lev,
-    pnl_percent: safeNum(pnl),
+    pnl_percent: Number.isFinite(pnl) ? pnl : 0,
     trade_log_message_id: m.id,
     created_at: m.createdAt
   };
@@ -269,7 +265,7 @@ async function getAllTimeFromLog(limitBest = 25, limitWorst = 25) {
     byUser.set(key, cur);
   }
   const totals = Array.from(byUser.values())
-    .map(v => ({ username: v.username, total: safeNum(v.best) + safeNum(v.worst) }))
+    .map(v => ({ username: v.username, total: (Number.isFinite(v.best)?v.best:0) + (Number.isFinite(v.worst)?v.worst:0) }))
     .sort((a,b) => b.total - a.total)
     .slice(0, 25);
 
@@ -282,13 +278,13 @@ async function getWeeklyTopFromLog(limit = 10) {
 }
 
 // ----------------- RENDER + BUDGETEER -----------------
-const EMBED_DESC_MAX = 4096;      // Discord per-embed description
-const MESSAGE_EMBEDS_BUDGET = 6000; // Discord totaal over ALLE embeds in één bericht
-const LINE_MAX = 140;             // iets strakker om ruimte te besparen
+const EMBED_DESC_MAX = 4096;          // per embed
+const MESSAGE_EMBEDS_BUDGET = 6000;   // totaal per bericht
+const LINE_MAX = 150;
 
 const trim = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
-// bouw één regel
+// één regel (met jouw exacte Trade-link label)
 function buildLine(r, idx, withLink = true) {
   const tag = medal(idx);
   const user = `**${r.username}**`;
@@ -301,7 +297,7 @@ function buildLine(r, idx, withLink = true) {
   return trim(`${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`, LINE_MAX);
 }
 
-// render met budget: eerst met links; als te lang -> zonder links; nog te lang -> items verminderen
+// budgetteer: eerst met link; zo niet passend → zonder link; dan items reduceren
 function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
   const useRows = rows.slice(0, preferredCount);
   let withLink = true;
@@ -315,19 +311,12 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
 
   while (true) {
     description = buildDesc();
-    // cap per-embed description
-    if (description.length > EMBED_DESC_MAX) {
-      count = Math.max(1, Math.floor(count * 0.9));
-      continue;
-    }
-
-    // check tegen gezamenlijk budget (ruwe schatting incl titel en marge)
+    if (description.length > EMBED_DESC_MAX) { count = Math.max(1, Math.floor(count * 0.9)); continue; }
     const approxSize = title.length + description.length + 50;
     if (approxSize <= budgetForThisEmbed) break;
 
     if (withLink) { withLink = false; continue; }
     if (count > 1) { count = Math.max(1, Math.floor(count * 0.9)); continue; }
-    // laatste redmiddel: hard trim
     description = trim(description, Math.min(EMBED_DESC_MAX, budgetForThisEmbed - title.length - 10));
     break;
   }
@@ -335,31 +324,26 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
   return new EmbedBuilder().setColor(0x111827).setTitle(title).setDescription(description);
 }
 
-// helper om 3 embeds in één bericht binnen 6000 total te houden
 function buildAllTimeEmbeds(best, worst, totals) {
-  // verdeel budget grofweg 45% / 45% / 10% en laat de budgetter in elke embed zelf fine-tunen
-  const totalBudget = MESSAGE_EMBEDS_BUDGET - 100; // buffer
+  const totalBudget = MESSAGE_EMBEDS_BUDGET - 100;
   const bBudget = Math.floor(totalBudget * 0.45);
   const wBudget = Math.floor(totalBudget * 0.45);
   const tBudget = Math.floor(totalBudget * 0.10);
 
   const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget);
   const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget);
-  const eb3 = renderWithBudget(
-    totals.map((r, idx) => ({
-      username: r.username,
-      symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
-    })),
-    "📊 Totale PnL % (best + worst)",
-    25,
-    tBudget
-  );
+
+  // Totals: render als simpele lijst "naam  `+xx.xx%`"
+  const totalsRows = totals.map((r, idx) => ({
+    username: r.username,
+    symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
+  }));
+  const eb3 = renderWithBudget(totalsRows, "📊 Totale PnL % (best + worst)", 25, tBudget);
 
   return [eb1, eb2, eb3];
 }
 
 function buildWeeklyEmbed(rows) {
-  // 1 embed → we mogen praktisch het hele 6000 budget gebruiken, maar hou ruime marge
   const budget = MESSAGE_EMBEDS_BUDGET - 200;
   return renderWithBudget(rows, "📈 Top 10 Weekly Trades (laatste 7 dagen)", 10, budget);
 }
@@ -367,7 +351,6 @@ function buildWeeklyEmbed(rows) {
 // ------------- RUNTIME -------------
 client.on("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  // bootstrap pas na 15s zodat slash-commands meteen kunnen reageren
   setTimeout(() => {
     bootstrapHistory().catch((e) => console.error("bootstrapHistory error:", e));
   }, 15000);
@@ -423,7 +406,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ---- Slash commands (altijd direct defer + duidelijke debug/fouten) ----
+// ---- Slash commands (altijd direct defer + budget-safe) ----
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
 
@@ -442,7 +425,6 @@ client.on("interactionCreate", async (i) => {
       try { await i.editReply("Bezig met verzamelen…"); } catch {}
 
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
-      console.log("[LB_ALLTIME]", "best:", best?.length ?? 0, "worst:", worst?.length ?? 0, "totals:", totals?.length ?? 0);
 
       if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
         return fail("Geen trades gevonden in #📝-trade-log (parser vond 0 items).");
@@ -457,7 +439,6 @@ client.on("interactionCreate", async (i) => {
       try { await i.editReply("Bezig met verzamelen…"); } catch {}
 
       const weekly = await getWeeklyTopFromLog(10);
-      console.log("[LB_DAILY]", "weekly:", weekly?.length ?? 0);
       if (!weekly?.length) return fail("Geen trades gevonden in de laatste 7 dagen.");
 
       const eb = buildWeeklyEmbed(weekly);
