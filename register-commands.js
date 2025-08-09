@@ -20,15 +20,15 @@ const trade = new SlashCommandBuilder()
   .addNumberOption(o => o.setName('exit').setDescription('exit prijs').setRequired(true))
   .addIntegerOption(o => o.setName('leverage').setDescription('hefboom (bijv. 35)').setRequired(true));
 
-const leaderboard = new SlashCommandBuilder()
-  .setName('leaderboard')
-  .setDescription('Toon leaderboards')
-  .addSubcommand(s => s.setName('alltime_gainers').setDescription('Top 25 all-time winsten'))
-  .addSubcommand(s => s.setName('alltime_losers').setDescription('Top 25 all-time verliezen'))
-  .addSubcommand(s => s.setName('totals').setDescription('Totale PnL % per gebruiker (best→worst)'))
-  .addSubcommand(s => s.setName('weekly_top10').setDescription('Top 10 trades van afgelopen 7 dagen'));
+const lbAllTime = new SlashCommandBuilder()
+  .setName('lb_alltime')
+  .setDescription('Post All-Time Top 25 wins + worst 25 + totals (nu)');
 
-const commands = [trade, leaderboard].map(c => c.toJSON());
+const lbDaily = new SlashCommandBuilder()
+  .setName('lb_daily')
+  .setDescription('Post Top 10 van de week (nu)');
+
+const commands = [trade, lbAllTime, lbDaily].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
