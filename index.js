@@ -45,7 +45,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// tabel + veilige indexen
+// tabel + veilige indexen (+ migratie voor bestaande tabellen)
 async function ensureDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
@@ -60,35 +60,32 @@ async function ensureDb() {
       entry_num            NUMERIC,
       exit_num             NUMERIC,
       pnl_percent          NUMERIC NOT NULL,
-      input_message_id     TEXT NOT NULL,
+      input_message_id     TEXT,
       trade_log_message_id TEXT,
-      channel_id           TEXT NOT NULL,
+      channel_id           TEXT,
       created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
-  const colExists = async (table, col) => {
-    const { rows } = await pool.query(
-      `SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
-      [table, col]
-    );
-    return rows.length > 0;
-  };
+  // --- schema migraties: voeg ontbrekende kolommen veilig toe ---
+  await pool.query(`
+    ALTER TABLE trades
+      ADD COLUMN IF NOT EXISTS trade_log_message_id TEXT,
+      ADD COLUMN IF NOT EXISTS entry_num NUMERIC,
+      ADD COLUMN IF NOT EXISTS exit_num NUMERIC,
+      ADD COLUMN IF NOT EXISTS input_message_id TEXT,
+      ADD COLUMN IF NOT EXISTS channel_id TEXT,
+      ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+  `);
 
   const makeIndex = async (idxName, sql) => {
     const { rows } = await pool.query(`SELECT to_regclass($1) AS exists`, [idxName]);
     if (!rows[0].exists) await pool.query(sql);
   };
 
-  if (await colExists("trades", "created_at")) {
-    await makeIndex("idx_trades_created_at", `CREATE INDEX idx_trades_created_at ON trades (created_at DESC);`);
-  }
-  if (await colExists("trades", "username") && await colExists("trades","pnl_percent")) {
-    await makeIndex("idx_trades_user_pnl", `CREATE INDEX idx_trades_user_pnl ON trades (username, pnl_percent DESC);`);
-  }
-  if (await colExists("trades", "pnl_percent")) {
-    await makeIndex("idx_trades_pnl", `CREATE INDEX idx_trades_pnl ON trades (pnl_percent DESC);`);
-  }
+  await makeIndex("idx_trades_created_at", `CREATE INDEX idx_trades_created_at ON trades (created_at DESC);`);
+  await makeIndex("idx_trades_user_pnl", `CREATE INDEX idx_trades_user_pnl ON trades (username, pnl_percent DESC);`);
+  await makeIndex("idx_trades_pnl", `CREATE INDEX idx_trades_pnl ON trades (pnl_percent DESC);`);
 }
 
 // ------------ DISCORD ------------
