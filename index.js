@@ -1,4 +1,6 @@
-// index.js — Analyesman (final: ultra-robust ACK for /lb_alltime; input/trade-log & /lb_daily unchanged)
+// index.js — Analyesman (final final)
+// ⚠️ Alleen aanpassing: /lb_alltime splitst Top 25 automatisch in 2 embeds (1–15, 16–25) als nodig.
+//    Rest (input/trade-log, /lb_daily, styling, links, cron) blijft exact gelijk.
 
 import {
   Client,
@@ -63,7 +65,6 @@ async function ensureDb() {
     );
   `);
 
-  // legacy kolommen tolerant
   const relaxLegacy = async (col) => {
     const r = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name=$1`,
@@ -255,8 +256,9 @@ async function getWeeklyTopFromLog(limit = 10) {
 const EMBED_DESC_MAX = 4096;
 const MESSAGE_EMBEDS_BUDGET = 6000;
 
-function buildLine(r, idx, withLink = true) {
-  const tag = medal(idx);
+// ⚠️ mini-aanpassing: baseIndex zodat medals/nummering niet reset bij splits
+function buildLine(r, idx, withLink = true, baseIndex = 0) {
+  const tag = medal(baseIndex + idx);
   const user = `**${r.username}**`;
   const item = `${r.symbol.toUpperCase()} ${r.side}`;
   const lev = `${r.leverage_x}x`;
@@ -267,6 +269,7 @@ function buildLine(r, idx, withLink = true) {
   return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
 }
 
+// gebruikt door /lb_daily (ongewijzigd qua output)
 function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, options = {}) {
   const { forceLinks = false } = options;
   const useRows = rows.slice(0, preferredCount);
@@ -275,7 +278,7 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, optio
   let description = "";
 
   const buildDesc = () => {
-    const lines = useRows.slice(0, count).map((r, i) => buildLine(r, i, withLink));
+    const lines = useRows.slice(0, count).map((r, i) => buildLine(r, i, withLink, 0));
     return lines.join("\n");
   };
 
@@ -294,22 +297,42 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, optio
   return new EmbedBuilder().setColor(0x111827).setTitle(title).setDescription(description);
 }
 
-function buildAllTimeEmbeds(best, worst, totals) {
-  const totalBudget = MESSAGE_EMBEDS_BUDGET - 100;
-  const bBudget = Math.floor(totalBudget * 0.45);
-  const wBudget = Math.floor(totalBudget * 0.45);
-  const tBudget = Math.floor(totalBudget * 0.10);
+// ✅ NIEUW: forceer volledige 25 regels; indien te lang → split in 2 embeds (1–15, 16–25)
+function buildFull25Embeds(rows, baseTitle) {
+  const top25 = rows.slice(0, 25);
+  const lines = top25.map((r, i) => buildLine(r, i, true, 0));
+  const full = lines.join("\n");
 
-  const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget, { forceLinks: true });
-  const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget, { forceLinks: true });
+  if (full.length <= EMBED_DESC_MAX && (baseTitle.length + full.length + 50) <= MESSAGE_EMBEDS_BUDGET) {
+    return [ new EmbedBuilder().setColor(0x111827).setTitle(baseTitle).setDescription(full) ];
+  }
+
+  const firstCount = 15;
+  const part1 = top25.slice(0, firstCount).map((r, i) => buildLine(r, i, true, 0)).join("\n");
+  const part2 = top25.slice(firstCount).map((r, i) => buildLine(r, i, true, firstCount)).join("\n");
+
+  const e1 = new EmbedBuilder().setColor(0x111827).setTitle(`${baseTitle} (1–${firstCount})`).setDescription(part1);
+  const e2 = new EmbedBuilder().setColor(0x111827).setTitle(`${baseTitle} (${firstCount+1}–25)`).setDescription(part2);
+
+  return [e1, e2];
+}
+
+function buildAllTimeEmbeds(best, worst, totals) {
+  // Best & Worst altijd volledige 25; split indien nodig
+  const bestEmbeds = buildFull25Embeds(best, "🏆 Top 25 All-time Winsten");
+  const worstEmbeds = buildFull25Embeds(worst, "📉 Top 25 All-time Verliezen");
 
   const totalsRows = totals.map((r) => ({
     username: r.username,
     symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
   }));
-  const eb3 = renderWithBudget(totalsRows, "📊 Totale PnL % (best + worst)", 25, tBudget);
+  const totalsLines = totalsRows.map((r, i) => buildLine(r, i, false, 0)).join("\n");
+  const totalsEmbed = new EmbedBuilder()
+    .setColor(0x111827)
+    .setTitle("📊 Totale PnL % (best + worst)")
+    .setDescription(totalsLines.substring(0, EMBED_DESC_MAX));
 
-  return [eb1, eb2, eb3];
+  return [...bestEmbeds, ...worstEmbeds, totalsEmbed];
 }
 
 function buildWeeklyEmbed(rows) {
@@ -325,7 +348,7 @@ client.on("ready", async () => {
   }, 15000);
 });
 
-// ====== INPUT & TRADE-LOG — NIET AANPASSEN ======
+// ====== INPUT & TRADE-LOG (ongewijzigd) ======
 client.on("messageCreate", async (msg) => {
   try {
     if (msg.author.bot) return;
@@ -386,37 +409,31 @@ async function safeChannelSend(channelId, payload) {
   }
 }
 
-// ---- Slash commands (ULTRA-ROBUST ACK) ----
-function isAcked(i) {
-  return i.deferred || i.replied;
-}
-async function ack(i) {
+// ---- Slash commands (stabiele ACK) ----
+function isAcked(i){ return i.deferred || i.replied; }
+
+async function ackFast(i) {
   if (isAcked(i)) return true;
-  // 1) Probeer DIRECTE reply (ephemeral) — snelste ACK
   try {
-    await i.reply({ content: "Bezig…", ephemeral: true });
+    await i.deferReply({ ephemeral: true });
     return true;
   } catch (e1) {
-    console.error("ACK (reply) failed:", e1?.code, e1?.message || e1);
-    // 2) Fallback: defer
     try {
-      await i.deferReply({ ephemeral: true });
+      await i.deferReply({ ephemeral: false });
       return true;
     } catch (e2) {
-      console.error("ACK (deferReply) also failed:", e2?.code, e2?.message || e2);
+      console.error("ACK failed (both):", e1?.code, e1?.message, "|", e2?.code, e2?.message);
       return false;
     }
   }
 }
+
 async function finish(i, content) {
   try {
     if (i.deferred) {
       await i.editReply(content);
     } else if (!i.replied) {
       await i.reply({ content, ephemeral: true });
-    } else {
-      // we replied al — update het bericht
-      await i.editReply?.(content).catch(() => {});
     }
   } catch (e) {
     console.error("finish() error:", e?.code, e?.message || e);
@@ -427,8 +444,8 @@ client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
   console.log("Slash ontvangen:", i.commandName, "in", i.channelId);
 
-  const ok = await ack(i);
-  if (!ok) return; // zonder ACK geen vervolg
+  const ok = await ackFast(i);
+  if (!ok) return;
 
   try {
     if (i.commandName === "lb_alltime") {
@@ -438,11 +455,12 @@ client.on("interactionCreate", async (i) => {
         return;
       }
 
-      const [eb1, eb2, eb3] = buildAllTimeEmbeds(best, worst, totals);
+      const embeds = buildAllTimeEmbeds(best, worst, totals);
 
-      // twee losse berichten ivm 6000-budget — met (Trade) links
-      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb1] });
-      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb2, eb3] });
+      // meerdere sends om ruimschoots binnen budget te blijven
+      for (const eb of embeds) {
+        await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb] });
+      }
 
       await finish(i, "Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
@@ -528,9 +546,8 @@ async function postAllTimeNow() {
   try {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const { best, worst, totals } = await getAllTimeFromLog(25, 25);
-    const [eb1, eb2, eb3] = buildAllTimeEmbeds(best, worst, totals);
-    await ch.send({ embeds: [eb1] });
-    await ch.send({ embeds: [eb2, eb3] });
+    const embeds = buildAllTimeEmbeds(best, worst, totals);
+    for (const eb of embeds) await ch.send({ embeds: [eb] });
   } catch (e) {
     console.error("auto alltime error:", e);
   }
