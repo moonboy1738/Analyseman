@@ -1,5 +1,5 @@
-// index.js  —  Analyesman (Heroku safe build)
-// Node 18+  |  discord.js v14  |  pg 8
+// index.js — Analyesman (Heroku safe, auto-history bootstrap)
+// Node 18+ | discord.js v14 | pg 8
 
 import {
   Client,
@@ -9,7 +9,6 @@ import {
   SlashCommandBuilder,
   REST,
   Routes,
-  PermissionsBitField,
 } from "discord.js";
 import pkg from "pg";
 import cron from "node-cron";
@@ -17,15 +16,14 @@ const { Pool } = pkg;
 
 // ------------ ENV ------------
 const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;         // application id
-const GUILD_ID = process.env.GUILD_ID;           // server id
+const CLIENT_ID = process.env.CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
 const DATABASE_URL = process.env.DATABASE_URL;
 const INPUT_CHANNEL_ID = process.env.INPUT_CHANNEL_ID;
 const TRADE_LOG_CHANNEL_ID = process.env.TRADE_LOG_CHANNEL_ID;
 const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 const TZ = process.env.TZ || "Europe/Amsterdam";
 
-// basic guard
 if (!TOKEN || !CLIENT_ID || !GUILD_ID || !DATABASE_URL) {
   console.error("❌ Missing TOKEN, CLIENT_ID, GUILD_ID or DATABASE_URL env.");
   process.exit(1);
@@ -45,9 +43,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Tabel + migraties + veilige indexen
 async function ensureDb() {
-  // 1) Basis: creëer tabel indien nodig (met defaults)
+  // Basis-tabel
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
       id                   BIGSERIAL PRIMARY KEY,
@@ -68,7 +65,7 @@ async function ensureDb() {
     );
   `);
 
-  // 2) Migraties (idempotent, incl. pnl_percent)
+  // Migrations (idempotent)
   await pool.query(`
     ALTER TABLE trades
       ADD COLUMN IF NOT EXISTS user_id TEXT,
@@ -87,7 +84,20 @@ async function ensureDb() {
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
 
-  // 3) Helpers
+  // Legacy kolommen 'entry'/'exit' loskoppelen (NULL toestaan zodat inserts niet crashen)
+  const relaxLegacy = async (col) => {
+    const q = `
+      SELECT 1 FROM information_schema.columns
+      WHERE table_name='trades' AND column_name=$1`;
+    const r = await pool.query(q, [col]);
+    if (r.rowCount) {
+      await pool.query(`ALTER TABLE trades ALTER COLUMN ${col} DROP NOT NULL`);
+    }
+  };
+  await relaxLegacy("entry");
+  await relaxLegacy("exit");
+
+  // Index helpers
   const colExists = async (table, col) => {
     const { rows } = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
@@ -100,7 +110,6 @@ async function ensureDb() {
     if (!rows[0].exists) await pool.query(sql);
   };
 
-  // 4) Indexen alleen als kolommen bestaan
   if (await colExists("trades", "created_at")) {
     await makeIndex("idx_trades_created_at", `CREATE INDEX idx_trades_created_at ON trades (created_at DESC);`);
   }
@@ -118,7 +127,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers, // handig voor latere lookups
+    GatewayIntentBits.GuildMembers,
   ],
   partials: [Partials.Channel, Partials.Message],
 });
@@ -131,8 +140,6 @@ const pnlBadge = (pnl) => {
   const s = v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`;
   return `\`${s}\``;
 };
-
-// toon geldwaarde met exact de ingevoerde precisie (max 6)
 function formatValueWithInputPrecision(raw) {
   if (raw == null) return null;
   let s = String(raw).trim();
@@ -143,16 +150,13 @@ function formatValueWithInputPrecision(raw) {
   return `$${s}`;
 }
 
-// parse functie (exact jouw format):
-// "!trade add <SYMBOL> <Long|Short> <entry> <exit?> <leverageX>"
+// parse: "!trade add <SYMBOL> <Long|Short> <entry> <exit?> <leverageX>"
 const TRADE_REGEX =
   /^!trade\s+add\s+([A-Za-z0-9._/-]+)\s+(long|short)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)?\s+([0-9]{1,4})\s*$/i;
 
-// input bericht (los, geen reply)
 const formatInputLine = (symbol, side, leverage, pnl) =>
   `Trade geregistreerd: **${symbol.toUpperCase()}** ${side} ${leverage}× → ${pnlBadge(pnl)}`;
 
-// trade-log bericht (kop + body exact als screenshot)
 const formatTradeLog = (usernameLower, symbol, side, leverage, entryRaw, exitRaw, pnl) => {
   const head = `**${usernameLower}**  ${pnlBadge(pnl)}`;
   const body = [
@@ -163,11 +167,10 @@ const formatTradeLog = (usernameLower, symbol, side, leverage, entryRaw, exitRaw
   return `${head}\n${body.join("\n")}`;
 };
 
-// ------------- COMMANDS -------------
+// ------------- COMMANDS (alleen leaderboards) -------------
 const cmds = [
   new SlashCommandBuilder().setName("lb_alltime").setDescription("Post All-Time Top 25 wins + worst 25 + totals (nu)"),
   new SlashCommandBuilder().setName("lb_daily").setDescription("Post Top 10 van de week (nu)"),
-  new SlashCommandBuilder().setName("backfill").setDescription("Eenmalig backfillen van #trade-log (admin)"),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
@@ -267,7 +270,6 @@ function renderBestWorstLines(rows) {
     return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
   });
 }
-
 function renderTotalsLines(rows) {
   return rows.map((r, idx) => {
     const tag = medal(idx);
@@ -279,11 +281,13 @@ function renderTotalsLines(rows) {
 }
 
 // ------------- RUNTIME -------------
-client.on("ready", () => {
+client.on("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  // start auto-history bootstrap op de achtergrond
+  bootstrapHistory().catch((e) => console.error("bootstrapHistory error:", e));
 });
 
-// text input parser in #input
+// Invoer in #input
 client.on("messageCreate", async (msg) => {
   try {
     if (msg.author.bot) return;
@@ -306,17 +310,16 @@ client.on("messageCreate", async (msg) => {
       pnl = ((exit - entry) / entry) * 100 * dir * Math.max(1, lev);
     }
 
-    // 1) los bericht in #input (géén reply)
+    // los bericht (géén reply)
     await msg.channel.send(formatInputLine(symbol, side, lev, pnl));
 
-    // 2) post in #trade-log exact jouw stijl
+    // post in trade-log
     const tradeLog = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
     const usernameLower = (msg.member?.displayName || msg.author.username).trim().toLowerCase();
-
     const content = formatTradeLog(usernameLower, symbol, side, lev, entryRaw, exitRaw, pnl);
     const tlMsg = await tradeLog.send(content);
 
-    // 3) opslaan in DB
+    // DB
     await insertTrade({
       user_id: msg.author.id,
       username: (msg.member?.displayName || msg.author.username).trim(),
@@ -340,90 +343,21 @@ client.on("messageCreate", async (msg) => {
 // slash commands
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
-
   try {
     if (i.commandName === "lb_alltime") {
       await i.deferReply({ ephemeral: false });
-
       const { best, worst, totals } = await getAllTime(25);
-
-      const eb1 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("🏆 Top 25 All-time Winsten")
-        .setDescription(renderBestWorstLines(best).join("\n"));
-
-      const eb2 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📉 Top 25 All-time Verliezen")
-        .setDescription(renderBestWorstLines(worst).join("\n"));
-
-      const eb3 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📊 Totale PnL % (best + worst)")
-        .setDescription(renderTotalsLines(totals).join("\n"));
-
+      const eb1 = new EmbedBuilder().setColor(0x111827).setTitle("🏆 Top 25 All-time Winsten").setDescription(renderBestWorstLines(best).join("\n"));
+      const eb2 = new EmbedBuilder().setColor(0x111827).setTitle("📉 Top 25 All-time Verliezen").setDescription(renderBestWorstLines(worst).join("\n"));
+      const eb3 = new EmbedBuilder().setColor(0x111827).setTitle("📊 Totale PnL % (best + worst)").setDescription(renderTotalsLines(totals).join("\n"));
       await i.editReply({ embeds: [eb1, eb2, eb3] });
     }
 
     if (i.commandName === "lb_daily") {
       await i.deferReply({ ephemeral: false });
-
       const weekly = await getWeeklyTop(10);
-      const lines = renderBestWorstLines(weekly);
-
-      const eb = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)")
-        .setDescription(lines.join("\n"));
-
+      const eb = new EmbedBuilder().setColor(0x111827).setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)").setDescription(renderBestWorstLines(weekly).join("\n"));
       await i.editReply({ embeds: [eb] });
-    }
-
-    if (i.commandName === "backfill") {
-      try {
-        // permissie check zonder fetch (voorkomt 3s no-response)
-        const hasManage = (() => {
-          try {
-            const pf = new PermissionsBitField(i.member?.permissions);
-            return pf.has(PermissionsBitField.Flags.ManageGuild);
-          } catch { return false; }
-        })();
-        if (!hasManage) {
-          await i.reply({ content: "Je hebt geen toestemming voor /backfill.", ephemeral: true });
-          return;
-        }
-
-        // reageer binnen 3s
-        await i.deferReply({ ephemeral: true });
-        await i.editReply("Backfill gestart… (0 verwerkt)");
-
-        // run met limit + progress callback
-        const LIMIT = 1200; // ruim boven jouw ~1000 berichten
-        const { processed, skipped, errors } = await runBackfillVerbose({
-          limit: LIMIT,
-          onProgress: async (state) => {
-            try {
-              await i.editReply(
-                `Backfill bezig… verwerkt: ${state.processed}, overgeslagen: ${state.skipped} (tot nu toe)`
-              );
-            } catch {}
-          },
-        });
-
-        let msg = `Backfill klaar. Verwerkt: ${processed}, overgeslagen: ${skipped}.`;
-        if (errors.length) {
-          msg += `\nFouten (${errors.length}):\n` + errors.slice(0,5).map(e => `• ${e}`).join("\n");
-          if (errors.length > 5) msg += `\n(+${errors.length - 5} extra)`;
-        }
-        await i.editReply(msg);
-      } catch (e) {
-        console.error("BACKFILL FATAL:", e);
-        if (i.deferred || i.replied) {
-          await i.editReply(`Backfill faalde: ${e?.message || e}`);
-        } else {
-          await i.reply({ content: `Backfill faalde: ${e?.message || e}`, ephemeral: true });
-        }
-      }
     }
   } catch (err) {
     console.error("interaction error:", err);
@@ -431,38 +365,34 @@ client.on("interactionCreate", async (i) => {
   }
 });
 
-// ------------- BACKFILL (sneller + progress + limiet) -------------
+// ------------- AUTO HISTORY BOOTSTRAP -------------
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-]?\d+(?:\.\d{1,2})?%)`/m;
 const BODY_REGEX = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})×\s*[\r\n]+Entry:\s+\$([0-9]*\.?[0-9]+)(?:[\r\n]+Exit:\s+\$([0-9]*\.?[0-9]+))?/m;
 
-async function runBackfillVerbose(opts = {}) {
-  const limit = typeof opts.limit === "number" ? opts.limit : 1200;
-  const onProgress = typeof opts.onProgress === "function" ? opts.onProgress : null;
-
+async function bootstrapHistory() {
+  const limit = 5000; // veiligheidslimiet
   const channel = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
+
   let lastId = null;
   let processed = 0;
   let skipped = 0;
-  const errors = [];
-  let seen = 0;
 
+  console.log("🧹 History bootstrap gestart…");
   while (true) {
-    if (seen >= limit) break;
+    if (processed + skipped >= limit) break;
 
     let batch;
     try {
       batch = await channel.messages.fetch({ limit: 100, before: lastId ?? undefined });
     } catch (e) {
-      errors.push(`messages.fetch failed: ${e?.message || e}`);
+      console.error("bootstrap fetch error:", e);
       break;
     }
     if (!batch || batch.size === 0) break;
 
     const msgs = Array.from(batch.values());
     for (const m of msgs) {
-      if (seen >= limit) break;
-      seen++;
-
+      if (processed + skipped >= limit) break;
       try {
         if (!m.author.bot) { skipped++; continue; }
 
@@ -474,10 +404,7 @@ async function runBackfillVerbose(opts = {}) {
         const usernameText = h[1].trim();
         if (EXCLUDE_USERNAMES.includes(usernameText.toLowerCase())) { skipped++; continue; }
 
-        const exist = await pool.query(
-          `SELECT 1 FROM trades WHERE trade_log_message_id=$1`,
-          [m.id]
-        );
+        const exist = await pool.query(`SELECT 1 FROM trades WHERE trade_log_message_id=$1`, [m.id]);
         if (exist.rowCount > 0) { skipped++; continue; }
 
         const pnlText = h[2].replace("%", "");
@@ -487,10 +414,10 @@ async function runBackfillVerbose(opts = {}) {
         const entryRaw = b[4];
         const exitRaw = b[5] || null;
 
-        // snelle user_id zonder live member fetch
+        // user-id best effort (niet lookupen om snelheid)
         const userId = `name:${usernameText.toLowerCase()}`;
 
-        // PnL (herbereken als exit aanwezig, anders uit pill)
+        // PnL (herbereken als exit aanwezig, anders lees pill)
         let pnl = 0;
         if (exitRaw) {
           const entry = Number(entryRaw);
@@ -519,20 +446,17 @@ async function runBackfillVerbose(opts = {}) {
 
         processed++;
       } catch (e) {
-        console.error(`Backfill error on message ${m?.id}:`, e);
-        errors.push(`msg ${m?.id}: ${e?.message || e}`);
+        console.error(`bootstrap error on message ${m?.id}:`, e);
+        skipped++;
       }
     }
 
-    if (onProgress) {
-      try { await onProgress({ processed, skipped }); } catch {}
-    }
-
+    console.log(`🧹 batch klaar — processed=${processed}, skipped=${skipped}`);
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 300)); // lichte throttle
+    await new Promise(r => setTimeout(r, 250)); // lichte throttle
   }
 
-  return { processed, skipped, errors };
+  console.log(`✅ History bootstrap klaar — processed=${processed}, skipped=${skipped}`);
 }
 
 // ------------- CRON (auto posts) -------------
@@ -541,20 +465,9 @@ async function postAllTimeNow() {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const { best, worst, totals } = await getAllTime(25);
 
-    const eb1 = new EmbedBuilder()
-      .setColor(0x111827)
-      .setTitle("🏆 Top 25 All-time Winsten")
-      .setDescription(renderBestWorstLines(best).join("\n"));
-
-    const eb2 = new EmbedBuilder()
-      .setColor(0x111827)
-      .setTitle("📉 Top 25 All-time Verliezen")
-      .setDescription(renderBestWorstLines(worst).join("\n"));
-
-    const eb3 = new EmbedBuilder()
-      .setColor(0x111827)
-      .setTitle("📊 Totale PnL % (best + worst)")
-      .setDescription(renderTotalsLines(totals).join("\n"));
+    const eb1 = new EmbedBuilder().setColor(0x111827).setTitle("🏆 Top 25 All-time Winsten").setDescription(renderBestWorstLines(best).join("\n"));
+    const eb2 = new EmbedBuilder().setColor(0x111827).setTitle("📉 Top 25 All-time Verliezen").setDescription(renderBestWorstLines(worst).join("\n"));
+    const eb3 = new EmbedBuilder().setColor(0x111827).setTitle("📊 Totale PnL % (best + worst)").setDescription(renderTotalsLines(totals).join("\n"));
 
     await ch.send({ embeds: [eb1, eb2, eb3] });
   } catch (e) {
@@ -566,20 +479,17 @@ async function postWeeklyNow() {
   try {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const weekly = await getWeeklyTop(10);
-    const eb = new EmbedBuilder()
-      .setColor(0x111827)
-      .setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)")
-      .setDescription(renderBestWorstLines(weekly).join("\n"));
+    const eb = new EmbedBuilder().setColor(0x111827).setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)").setDescription(renderBestWorstLines(weekly).join("\n"));
     await ch.send({ embeds: [eb] });
   } catch (e) {
     console.error("auto weekly error:", e);
   }
 }
 
-// plan: zondag 20:00 en dagelijks 09:00 (Europe/Amsterdam)
+// plan: zondag 20:00 en dagelijks 09:00
 function setupCrons() {
-  cron.schedule("0 20 * * 0", postAllTimeNow, { timezone: TZ }); // Sun 20:00
-  cron.schedule("0 9 * * *", postWeeklyNow, { timezone: TZ });   // Daily 09:00
+  cron.schedule("0 20 * * 0", postAllTimeNow, { timezone: TZ });
+  cron.schedule("0 9 * * *", postWeeklyNow, { timezone: TZ });
 }
 
 // ------------ STARTUP ------------
