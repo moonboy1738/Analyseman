@@ -1,4 +1,4 @@
-import { REST, Routes } from 'discord.js';
+import { REST, Routes, SlashCommandBuilder } from 'discord.js';
 
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID  = process.env.GUILD_ID;
@@ -9,21 +9,26 @@ if (!CLIENT_ID || !GUILD_ID || !TOKEN) {
   process.exit(1);
 }
 
-// /trade met jouw velden
-const commands = [
-  {
-    name: 'trade',
-    description: 'Voeg een trade toe',
-    options: [
-      { name: 'actie', description: 'add', type: 3, required: true, choices:[{name:'add', value:'add'}] },
-      { name: 'symbool', description: 'bv. PENG', type: 3, required: true },
-      { name: 'zijde', description: 'Long of Short', type: 3, required: true, choices:[{name:'Long',value:'Long'},{name:'Short',value:'Short'}] },
-      { name: 'entry', description: 'entry prijs', type: 10, required: true },
-      { name: 'exit', description: 'exit prijs', type: 10, required: true },
-      { name: 'leverage', description: 'hefboom (bijv. 35)', type: 4, required: true }
-    ]
-  }
-];
+const trade = new SlashCommandBuilder()
+  .setName('trade')
+  .setDescription('Voeg een trade toe')
+  .addStringOption(o => o.setName('actie').setDescription('add').addChoices({name:'add',value:'add'}).setRequired(true))
+  .addStringOption(o => o.setName('symbool').setDescription('bv. PENG').setRequired(true))
+  .addStringOption(o => o.setName('zijde').setDescription('Long of Short')
+      .addChoices({name:'Long',value:'Long'},{name:'Short',value:'Short'}).setRequired(true))
+  .addNumberOption(o => o.setName('entry').setDescription('entry prijs').setRequired(true))
+  .addNumberOption(o => o.setName('exit').setDescription('exit prijs').setRequired(true))
+  .addIntegerOption(o => o.setName('leverage').setDescription('hefboom (bijv. 35)').setRequired(true));
+
+const leaderboard = new SlashCommandBuilder()
+  .setName('leaderboard')
+  .setDescription('Toon leaderboards')
+  .addSubcommand(s => s.setName('alltime_gainers').setDescription('Top 25 all-time winsten'))
+  .addSubcommand(s => s.setName('alltime_losers').setDescription('Top 25 all-time verliezen'))
+  .addSubcommand(s => s.setName('totals').setDescription('Totale PnL % per gebruiker (best→worst)'))
+  .addSubcommand(s => s.setName('weekly_top10').setDescription('Top 10 trades van afgelopen 7 dagen'));
+
+const commands = [trade, leaderboard].map(c => c.toJSON());
 
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
