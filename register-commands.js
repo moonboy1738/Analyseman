@@ -9,7 +9,7 @@ if (!CLIENT_ID || !GUILD_ID || !TOKEN) {
   process.exit(1);
 }
 
-// Eén command: /trade (actie, symbool, zijde, entry, exit, leverage)
+// /trade met jouw velden
 const commands = [
   {
     name: 'trade',
