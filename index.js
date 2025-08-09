@@ -49,21 +49,21 @@ const pool = new Pool({
 async function ensureDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
-      id                  BIGSERIAL PRIMARY KEY,
-      user_id             TEXT NOT NULL,
-      username            TEXT NOT NULL,
-      symbol              TEXT NOT NULL,
-      side                TEXT NOT NULL,
-      leverage_x          INTEGER NOT NULL,
-      entry_raw           TEXT NOT NULL,
-      exit_raw            TEXT,
-      entry_num           NUMERIC,
-      exit_num            NUMERIC,
-      pnl_percent         NUMERIC NOT NULL,
-      input_message_id    TEXT NOT NULL,
+      id                   BIGSERIAL PRIMARY KEY,
+      user_id              TEXT NOT NULL,
+      username             TEXT NOT NULL,
+      symbol               TEXT NOT NULL,
+      side                 TEXT NOT NULL,
+      leverage_x           INTEGER NOT NULL,
+      entry_raw            TEXT NOT NULL,
+      exit_raw             TEXT,
+      entry_num            NUMERIC,
+      exit_num             NUMERIC,
+      pnl_percent          NUMERIC NOT NULL,
+      input_message_id     TEXT NOT NULL,
       trade_log_message_id TEXT,
-      channel_id          TEXT NOT NULL,
-      created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      channel_id           TEXT NOT NULL,
+      created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
 
@@ -97,35 +97,27 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers, // voor backfill naam->ID lookup
   ],
   partials: [Partials.Channel, Partials.Message],
 });
 
-// ⏱ helpers
-const now = () => new Date();
-
-// medal
+// helpers
 const medal = (i) => (i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`);
-
-// maak “Trade” link
-const tradeLink = (guildId, channelId, messageId) =>
-  `[(Trade)](https://discord.com/channels/${guildId}/${channelId}/${messageId})`;
-
-// get PnL pill
+const tradeLink = (gid, cid, mid) => `[(Trade)](https://discord.com/channels/${gid}/${cid}/${mid})`;
 const pnlBadge = (pnl) => {
   const v = Number(pnl);
   const s = v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`;
   return `\`${s}\``;
 };
 
-// toon waarde met exact dezelfde precisie als input (max 6)
+// toon geldwaarde met exact de ingevoerde precisie (max 6)
 function formatValueWithInputPrecision(raw) {
   if (raw == null) return null;
   let s = String(raw).trim();
-  // cap op 6 decimals
   if (s.includes(".")) {
     const [a, b] = s.split(".");
-    s = b.length > 6 ? `${a}.${b.slice(0, 6)}` : s;
+    if (b.length > 6) s = `${a}.${b.slice(0, 6)}`;
   }
   return `$${s}`;
 }
@@ -135,19 +127,19 @@ function formatValueWithInputPrecision(raw) {
 const TRADE_REGEX =
   /^!trade\s+add\s+([A-Za-z0-9._/-]+)\s+(long|short)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)?\s+([0-9]{1,4})\s*$/i;
 
-// schrijf naar #input los bericht (geen reply)
+// input bericht (los, geen reply)
 const formatInputLine = (symbol, side, leverage, pnl) =>
   `Trade geregistreerd: **${symbol.toUpperCase()}** ${side} ${leverage}× → ${pnlBadge(pnl)}`;
 
-// schrijf naar #trade-log
+// trade-log bericht (kop + body exact als screenshot)
 const formatTradeLog = (usernameLower, symbol, side, leverage, entryRaw, exitRaw, pnl) => {
   const head = `**${usernameLower}**  ${pnlBadge(pnl)}`;
-  const bodyLines = [
+  const body = [
     `${symbol.toUpperCase()} ${side} ${leverage}×`,
-    `Entry: ${formatValueWithInputPrecision(entryRaw)}`,
+    `Entry: ${formatValueWithInputPrecision(entryRaw)}`
   ];
-  if (exitRaw) bodyLines.push(`Exit:  ${formatValueWithInputPrecision(exitRaw)}`);
-  return `${head}\n${bodyLines.join("\n")}`;
+  if (exitRaw) body.push(`Exit:  ${formatValueWithInputPrecision(exitRaw)}`);
+  return `${head}\n${body.join("\n")}`;
 };
 
 // ------------- COMMANDS -------------
@@ -187,7 +179,7 @@ async function insertTrade(row) {
   return rows[0];
 }
 
-const excludeClause = `LOWER(username) <> ALL($1)`; // array param
+const excludeClause = `LOWER(username) <> ALL($1)`;
 
 async function getAllTime(limit = 25) {
   const best = await pool.query(
@@ -240,7 +232,7 @@ async function getWeeklyTop(limit = 10) {
   return rows;
 }
 
-// helpers render
+// render helpers
 function renderBestWorstLines(rows) {
   return rows.map((r, idx) => {
     const tag = medal(idx);
@@ -298,17 +290,13 @@ client.on("messageCreate", async (msg) => {
 
     // 2) post in #trade-log exact jouw stijl
     const tradeLog = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
-    const usernameLower =
-      (msg.member?.displayName || msg.author.username).trim().toLowerCase();
+    const usernameLower = (msg.member?.displayName || msg.author.username).trim().toLowerCase();
 
-    const content = formatTradeLog(
-      usernameLower, symbol, side, lev, entryRaw, exitRaw, pnl
-    );
-
+    const content = formatTradeLog(usernameLower, symbol, side, lev, entryRaw, exitRaw, pnl);
     const tlMsg = await tradeLog.send(content);
 
     // 3) opslaan in DB
-    const row = await insertTrade({
+    await insertTrade({
       user_id: msg.author.id,
       username: (msg.member?.displayName || msg.author.username).trim(),
       symbol: symbol.trim(),
@@ -319,8 +307,8 @@ client.on("messageCreate", async (msg) => {
       entry_num: isNaN(Number(entryRaw)) ? null : Number(entryRaw),
       exit_num: exitRaw && !isNaN(Number(exitRaw)) ? Number(exitRaw) : null,
       pnl_percent: Number(pnl.toFixed(6)),
-      input_message_id: msg.id,                      // input msg id
-      trade_log_message_id: tlMsg.id,                // trade log msg id
+      input_message_id: msg.id,
+      trade_log_message_id: tlMsg.id,
       channel_id: msg.channelId,
     });
   } catch (err) {
@@ -331,6 +319,7 @@ client.on("messageCreate", async (msg) => {
 // slash commands
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
+
   try {
     if (i.commandName === "lb_alltime") {
       await i.deferReply({ ephemeral: false });
@@ -377,8 +366,18 @@ client.on("interactionCreate", async (i) => {
         return;
       }
       await i.reply({ content: "Backfill gestart. Dit kan even duren…", ephemeral: true });
-      const count = await runBackfill();
-      await i.followUp({ content: `Backfill klaar. ${count} trades verwerkt.`, ephemeral: true });
+      try {
+        const { processed, skipped, errors } = await runBackfillVerbose();
+        let msg = `Backfill klaar. Verwerkt: ${processed}, overgeslagen: ${skipped}.`;
+        if (errors.length) {
+          msg += `\nFouten (${errors.length}):\n` + errors.slice(0,5).map(e => `• ${e}`).join("\n");
+          if (errors.length > 5) msg += `\n(+${errors.length - 5} extra)`;
+        }
+        await i.followUp({ content: msg, ephemeral: true });
+      } catch (e) {
+        console.error("BACKFILL FATAL:", e);
+        await i.followUp({ content: `Backfill faalde: ${e?.message || e}`, ephemeral: true });
+      }
     }
   } catch (err) {
     console.error("interaction error:", err);
@@ -386,90 +385,99 @@ client.on("interactionCreate", async (i) => {
   }
 });
 
-// ------------- BACKFILL -------------
+// ------------- BACKFILL (robuust + logging) -------------
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-]?\d+(?:\.\d{1,2})?%)`/m;
 const BODY_REGEX = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})×\s*[\r\n]+Entry:\s+\$([0-9]*\.?[0-9]+)(?:[\r\n]+Exit:\s+\$([0-9]*\.?[0-9]+))?/m;
 
-async function runBackfill() {
+async function runBackfillVerbose() {
   const channel = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   let lastId = null;
-  let total = 0;
+  let processed = 0;
+  let skipped = 0;
+  const errors = [];
 
   while (true) {
-    const batch = await channel.messages.fetch({ limit: 100, before: lastId ?? undefined });
+    let batch;
+    try {
+      batch = await channel.messages.fetch({ limit: 100, before: lastId ?? undefined });
+    } catch (e) {
+      errors.push(`messages.fetch failed: ${e?.message || e}`);
+      break;
+    }
     if (batch.size === 0) break;
 
     const msgs = Array.from(batch.values());
     for (const m of msgs) {
-      // Alleen bot-berichten die ons format lijken te hebben
-      if (!m.author.bot) continue;
-
-      const content = m.content ?? "";
-      const h = content.match(HEADER_REGEX);
-      const b = content.match(BODY_REGEX);
-      if (!h || !b) continue;
-
-      const usernameText = h[1].trim();
-      const pnlText = h[2].replace("%",""); // met teken
-      const symbol = b[1].toUpperCase();
-      const side = b[2];
-      const lev = parseInt(b[3],10);
-      const entryRaw = b[4];
-      const exitRaw = b[5] || null;
-
-      // sla over als uitgesloten user
-      if (EXCLUDE_USERNAMES.includes(usernameText.toLowerCase())) continue;
-
-      // bestaat al?
-      const exist = await pool.query(
-        `SELECT 1 FROM trades WHERE trade_log_message_id=$1`,
-        [m.id]
-      );
-      if (exist.rowCount > 0) continue;
-
-      // probeer member-ID te vinden
-      let userId = `name:${usernameText.toLowerCase()}`;
       try {
-        const members = await m.guild.members.fetch({ query: usernameText, limit: 1 });
-        const cand = members.find(mm => mm.displayName.toLowerCase() === usernameText.toLowerCase()
-          || mm.user.username.toLowerCase() === usernameText.toLowerCase());
-        if (cand) userId = cand.id;
-      } catch {}
+        if (!m.author.bot) { skipped++; continue; }
+        const content = m.content ?? "";
+        const h = content.match(HEADER_REGEX);
+        const b = content.match(BODY_REGEX);
+        if (!h || !b) { skipped++; continue; }
 
-      // pnl herberekenen (voorkeur) als exit bestaat; anders parse uit pill
-      let pnl = 0;
-      if (exitRaw) {
-        const entry = Number(entryRaw);
-        const exit = Number(exitRaw);
-        const dir = side === "Long" ? 1 : -1;
-        pnl = ((exit - entry) / entry) * 100 * dir * Math.max(1, lev);
-      } else {
-        pnl = Number(pnlText); // bv +12.34 of -33.86
+        const usernameText = h[1].trim();
+        if (EXCLUDE_USERNAMES.includes(usernameText.toLowerCase())) { skipped++; continue; }
+
+        const exist = await pool.query(`SELECT 1 FROM trades WHERE trade_log_message_id=$1`, [m.id]);
+        if (exist.rowCount > 0) { skipped++; continue; }
+
+        const pnlText = h[2].replace("%","");
+        const symbol = b[1].toUpperCase();
+        const side = b[2];
+        const lev = parseInt(b[3],10);
+        const entryRaw = b[4];
+        const exitRaw = b[5] || null;
+
+        // Probeer member-ID te vinden (fallback op name:<lowercase>)
+        let userId = `name:${usernameText.toLowerCase()}`;
+        try {
+          const members = await m.guild.members.fetch({ query: usernameText, limit: 1 });
+          const cand = members.find(mm =>
+            mm.displayName.toLowerCase() === usernameText.toLowerCase() ||
+            mm.user.username.toLowerCase() === usernameText.toLowerCase()
+          );
+          if (cand) userId = cand.id;
+        } catch {}
+
+        // PnL
+        let pnl = 0;
+        if (exitRaw) {
+          const entry = Number(entryRaw);
+          const exit = Number(exitRaw);
+          const dir = side === "Long" ? 1 : -1;
+          pnl = ((exit - entry) / entry) * 100 * dir * Math.max(1, lev);
+        } else {
+          pnl = Number(pnlText);
+        }
+
+        await insertTrade({
+          user_id: userId,
+          username: usernameText,
+          symbol,
+          side,
+          leverage_x: lev,
+          entry_raw: entryRaw,
+          exit_raw: exitRaw,
+          entry_num: isNaN(Number(entryRaw)) ? null : Number(entryRaw),
+          exit_num: exitRaw && !isNaN(Number(exitRaw)) ? Number(exitRaw) : null,
+          pnl_percent: Number(pnl.toFixed(6)),
+          input_message_id: m.id,          // geen input-id bekend; gebruik message id
+          trade_log_message_id: m.id,
+          channel_id: TRADE_LOG_CHANNEL_ID,
+        });
+
+        processed++;
+      } catch (e) {
+        console.error(`Backfill error on message ${m.id}:`, e);
+        errors.push(`msg ${m.id}: ${e?.message || e}`);
       }
-
-      await insertTrade({
-        user_id: userId,
-        username: usernameText,              // bewaar zoals getoond
-        symbol,
-        side,
-        leverage_x: lev,
-        entry_raw: entryRaw,
-        exit_raw: exitRaw,
-        entry_num: isNaN(Number(entryRaw)) ? null : Number(entryRaw),
-        exit_num: exitRaw && !isNaN(Number(exitRaw)) ? Number(exitRaw) : null,
-        pnl_percent: Number(pnl.toFixed(6)),
-        input_message_id: m.id,              // geen echte input bekend; gebruik msg id
-        trade_log_message_id: m.id,
-        channel_id: TRADE_LOG_CHANNEL_ID,
-      });
-
-      total++;
     }
 
     lastId = msgs[msgs.length - 1].id;
+    await new Promise(r => setTimeout(r, 500)); // throttle tegen ratelimits
   }
 
-  return total;
+  return { processed, skipped, errors };
 }
 
 // ------------- CRON (auto posts) -------------
@@ -513,7 +521,7 @@ async function postWeeklyNow() {
   }
 }
 
-// plan: zondag 20:00 en dagelijks 09:00
+// plan: zondag 20:00 en dagelijks 09:00 (Europe/Amsterdam)
 function setupCrons() {
   cron.schedule("0 20 * * 0", postAllTimeNow, { timezone: TZ }); // Sun 20:00
   cron.schedule("0 9 * * *", postWeeklyNow, { timezone: TZ });   // Daily 09:00
@@ -526,6 +534,7 @@ function setupCrons() {
     await registerCommands();
     await client.login(TOKEN);
     setupCrons();
+    console.log("🚀 Bot running with TZ:", TZ);
   } catch (err) {
     console.error("Startup error:", err);
     process.exit(1);
