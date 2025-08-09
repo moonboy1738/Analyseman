@@ -1,5 +1,5 @@
 // index.js — Analyesman (final final)
-// ⚠️ Alleen aanpassing: /lb_alltime splitst Top 25 automatisch in 2 embeds (1–15, 16–25) als nodig.
+// ⚠️ Alleen aanpassing eerder: /lb_alltime splitst Top 25 automatisch in 2 embeds (1–15, 16–25) als nodig.
 //    Rest (input/trade-log, /lb_daily, styling, links, cron) blijft exact gelijk.
 
 import {
@@ -114,11 +114,11 @@ function formatValueWithInputPrecision(raw) {
 }
 
 // Parse regex (exact format in #📝-trade-log)
-const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
-const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
+const HEADER_REGEX = /^\\*\\*(.+?)\\*\\*\\s+`([+\\-\\u2212]?\\d+(?:\\.\\d+)?%)`/m;
+const BODY_REGEX   = /([A-Z0-9._/-]+)\\s+(Long|Short)\\s+(\\d{1,4})(?:x|×)\\s*/m;
 
 const TRADE_REGEX =
-  /^!trade\s+add\s+([A-Za-z0-9._/-]+)\s+(long|short)\s+([0-9]*\.?[0-9]+)\s+([0-9]*\.?[0-9]+)?\s+([0-9]{1,4})\s*$/i;
+  /^!trade\\s+add\\s+([A-Za-z0-9._/-]+)\\s+(long|short)\\s+([0-9]*\\.?[0-9]+)\\s+([0-9]*\\.?[0-9]+)?\\s+([0-9]{1,4})\\s*$/i;
 
 const formatInputLine = (symbol, side, leverage, pnl) =>
   `Trade geregistreerd: **${symbol.toUpperCase()}** ${side} ${leverage}× → ${pnlBadge(pnl)}`;
@@ -130,7 +130,7 @@ const formatTradeLog = (usernameLower, symbol, side, leverage, entryRaw, exitRaw
     `Entry: ${formatValueWithInputPrecision(entryRaw)}`
   ];
   if (exitRaw) body.push(`Exit:  ${formatValueWithInputPrecision(exitRaw)}`);
-  return `${head}\n${body.join("\n")}`;
+  return `${head}\\n${body.join("\\n")}`;
 };
 
 // ------------- COMMANDS -------------
@@ -170,7 +170,7 @@ async function insertTrade(row) {
 }
 
 // ----------------- DATA UIT #trade-log -----------------
-const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\u2212","-"));
+const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\\u2212","-"));
 
 function parseTradeFromMessage(m) {
   const content = m.content ?? "";
@@ -256,7 +256,7 @@ async function getWeeklyTopFromLog(limit = 10) {
 const EMBED_DESC_MAX = 4096;
 const MESSAGE_EMBEDS_BUDGET = 6000;
 
-// ⚠️ mini-aanpassing: baseIndex zodat medals/nummering niet reset bij splits
+// mini-aanpassing: baseIndex zodat medals/nummering niet reset bij splits
 function buildLine(r, idx, withLink = true, baseIndex = 0) {
   const tag = medal(baseIndex + idx);
   const user = `**${r.username}**`;
@@ -269,7 +269,7 @@ function buildLine(r, idx, withLink = true, baseIndex = 0) {
   return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
 }
 
-// gebruikt door /lb_daily (ongewijzigd qua output)
+// gebruikt door /lb_daily
 function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, options = {}) {
   const { forceLinks = false } = options;
   const useRows = rows.slice(0, preferredCount);
@@ -279,7 +279,7 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, optio
 
   const buildDesc = () => {
     const lines = useRows.slice(0, count).map((r, i) => buildLine(r, i, withLink, 0));
-    return lines.join("\n");
+    return lines.join("\\n");
   };
 
   while (true) {
@@ -297,19 +297,19 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, optio
   return new EmbedBuilder().setColor(0x111827).setTitle(title).setDescription(description);
 }
 
-// ✅ NIEUW: forceer volledige 25 regels; indien te lang → split in 2 embeds (1–15, 16–25)
+// ✅ forceer volledige 25 regels; indien te lang → split in 2 embeds (1–15, 16–25)
 function buildFull25Embeds(rows, baseTitle) {
   const top25 = rows.slice(0, 25);
   const lines = top25.map((r, i) => buildLine(r, i, true, 0));
-  const full = lines.join("\n");
+  const full = lines.join("\\n");
 
   if (full.length <= EMBED_DESC_MAX && (baseTitle.length + full.length + 50) <= MESSAGE_EMBEDS_BUDGET) {
     return [ new EmbedBuilder().setColor(0x111827).setTitle(baseTitle).setDescription(full) ];
   }
 
   const firstCount = 15;
-  const part1 = top25.slice(0, firstCount).map((r, i) => buildLine(r, i, true, 0)).join("\n");
-  const part2 = top25.slice(firstCount).map((r, i) => buildLine(r, i, true, firstCount)).join("\n");
+  const part1 = top25.slice(0, firstCount).map((r, i) => buildLine(r, i, true, 0)).join("\\n");
+  const part2 = top25.slice(firstCount).map((r, i) => buildLine(r, i, true, firstCount)).join("\\n");
 
   const e1 = new EmbedBuilder().setColor(0x111827).setTitle(`${baseTitle} (1–${firstCount})`).setDescription(part1);
   const e2 = new EmbedBuilder().setColor(0x111827).setTitle(`${baseTitle} (${firstCount+1}–25)`).setDescription(part2);
@@ -326,7 +326,7 @@ function buildAllTimeEmbeds(best, worst, totals) {
     username: r.username,
     symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
   }));
-  const totalsLines = totalsRows.map((r, i) => buildLine(r, i, false, 0)).join("\n");
+  const totalsLines = totalsRows.map((r, i) => buildLine(r, i, false, 0)).join("\\n");
   const totalsEmbed = new EmbedBuilder()
     .setColor(0x111827)
     .setTitle("📊 Totale PnL % (best + worst)")
@@ -565,8 +565,10 @@ async function postWeeklyNow() {
 }
 
 function setupCrons() {
-  cron.schedule("0 20 * * 0", postAllTimeNow, { timezone: TZ }); // zondag 20:00
-  cron.schedule("0 9 * * *", postWeeklyNow, { timezone: TZ });   // dagelijks 09:00
+  // ✅ Dagelijks om 09:00 Europe/Amsterdam → Weekly Top 10
+  cron.schedule("0 9 * * *", postWeeklyNow, { timezone: TZ });
+  // ✅ Elke zondag om 20:00 Europe/Amsterdam → All-time lijsten
+  cron.schedule("0 20 * * 0", postAllTimeNow, { timezone: TZ });
 }
 
 // ------------ STARTUP ------------
