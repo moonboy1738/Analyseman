@@ -1,4 +1,4 @@
-// index.js — Analyesman (final: stable deferReply, Trade links overal, budget-safe; input & trade-log ongewijzigd)
+// index.js — Analyesman (final: robust ACK for /lb_alltime; input/trade-log & /lb_daily unchanged)
 
 import {
   Client,
@@ -111,7 +111,7 @@ function formatValueWithInputPrecision(raw) {
   return `$${s}`;
 }
 
-// Parse regex (exact jouw format in #📝-trade-log)
+// Parse regex (exact format in #📝-trade-log)
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
 const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
 
@@ -255,7 +255,6 @@ async function getWeeklyTopFromLog(limit = 10) {
 const EMBED_DESC_MAX = 4096;
 const MESSAGE_EMBEDS_BUDGET = 6000;
 
-// GEEN per-regel trim → links blijven heel
 function buildLine(r, idx, withLink = true) {
   const tag = medal(idx);
   const user = `**${r.username}**`;
@@ -268,7 +267,6 @@ function buildLine(r, idx, withLink = true) {
   return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
 }
 
-// budgetteer: links eventueel afdwingen; reduceer eerst aantal regels; trim niet midden in link
 function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, options = {}) {
   const { forceLinks = false } = options;
   const useRows = rows.slice(0, preferredCount);
@@ -388,27 +386,50 @@ async function safeChannelSend(channelId, payload) {
   }
 }
 
-// ---- Slash commands: ALTIJD eerst deferReply (ephemeral), daarna kanaalpost ----
+// ---- Slash commands (robust ACK for lb_alltime) ----
+function isAcked(i) {
+  return i.deferred || i.replied;
+}
+async function ack(i) {
+  if (isAcked(i)) return true;
+  try {
+    await i.deferReply({ ephemeral: true });
+    return true;
+  } catch (e) {
+    console.error("ACK (deferReply) failed:", e?.code, e?.message || e);
+    try {
+      await i.reply({ content: "Bezig…", ephemeral: true });
+      return true;
+    } catch (e2) {
+      console.error("ACK (reply) also failed:", e2?.code, e2?.message || e2);
+      return false;
+    }
+  }
+}
+async function finish(i, content) {
+  try {
+    if (i.deferred) {
+      await i.editReply(content);
+    } else if (!i.replied) {
+      await i.reply({ content, ephemeral: true });
+    }
+  } catch (e) {
+    console.error("finish() error:", e?.code, e?.message || e);
+  }
+}
+
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
   console.log("Slash ontvangen:", i.commandName, "in", i.channelId);
 
-  // 1) Onmiddellijke ACK — voorkomt “application did not respond”
-  try {
-    if (!i.deferred && !i.replied) {
-      await i.deferReply({ ephemeral: true });
-    }
-  } catch (e) {
-    console.error("Kon niet deferReply'en:", e);
-    return; // zonder ACK kun je niet verder; voorkom 15s fout
-  }
+  const ok = await ack(i);
+  if (!ok) return;
 
-  // 2) Data uit #📝-trade-log ophalen en posten
   try {
     if (i.commandName === "lb_alltime") {
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
       if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
-        await i.editReply("Geen trades gevonden in #📝-trade-log.");
+        await finish(i, "Geen trades gevonden in #📝-trade-log.");
         return;
       }
 
@@ -418,23 +439,23 @@ client.on("interactionCreate", async (i) => {
       await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb1] });
       await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb2, eb3] });
 
-      await i.editReply("Klaar ✅ — lijst gepost in #🏆-leaderboard.");
+      await finish(i, "Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
     }
 
     if (i.commandName === "lb_daily") {
       const weekly = await getWeeklyTopFromLog(10);
       if (!weekly?.length) {
-        await i.editReply("Geen trades gevonden in de laatste 7 dagen.");
+        await finish(i, "Geen trades gevonden in de laatste 7 dagen.");
         return;
       }
       const eb = buildWeeklyEmbed(weekly);
       await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb] });
-      await i.editReply("Klaar ✅ — lijst gepost in #🏆-leaderboard.");
+      await finish(i, "Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
     }
 
-    await i.editReply("Onbekende command.");
+    await finish(i, "Onbekende command.");
   } catch (err) {
     console.error("interaction error:", err);
     try {
@@ -442,7 +463,7 @@ client.on("interactionCreate", async (i) => {
         content: `Er ging iets mis bij het opbouwen van de lijst: ${err?.message ?? err}`,
       });
     } catch {}
-    try { await i.editReply("Er ging iets mis bij het opbouwen van de lijst."); } catch {}
+    await finish(i, "Er ging iets mis bij het opbouwen van de lijst.");
   }
 });
 
