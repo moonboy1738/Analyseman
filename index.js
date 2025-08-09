@@ -45,8 +45,9 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// tabel + veilige indexen (+ migratie voor bestaande tabellen)
+// Tabel + migraties + veilige indexen
 async function ensureDb() {
+  // 1) Basis: creëer tabel indien nodig (met defaults)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS trades (
       id                   BIGSERIAL PRIMARY KEY,
@@ -59,7 +60,7 @@ async function ensureDb() {
       exit_raw             TEXT,
       entry_num            NUMERIC,
       exit_num             NUMERIC,
-      pnl_percent          NUMERIC NOT NULL,
+      pnl_percent          NUMERIC NOT NULL DEFAULT 0,
       input_message_id     TEXT,
       trade_log_message_id TEXT,
       channel_id           TEXT,
@@ -67,25 +68,48 @@ async function ensureDb() {
     );
   `);
 
-  // schema migraties (safe, idempotent)
+  // 2) Migraties: voeg ontbrekende kolommen toe (idempotent, inclusief pnl_percent)
   await pool.query(`
     ALTER TABLE trades
-      ADD COLUMN IF NOT EXISTS trade_log_message_id TEXT,
+      ADD COLUMN IF NOT EXISTS user_id TEXT,
+      ADD COLUMN IF NOT EXISTS username TEXT,
+      ADD COLUMN IF NOT EXISTS symbol TEXT,
+      ADD COLUMN IF NOT EXISTS side TEXT,
+      ADD COLUMN IF NOT EXISTS leverage_x INTEGER,
+      ADD COLUMN IF NOT EXISTS entry_raw TEXT,
+      ADD COLUMN IF NOT EXISTS exit_raw TEXT,
       ADD COLUMN IF NOT EXISTS entry_num NUMERIC,
       ADD COLUMN IF NOT EXISTS exit_num NUMERIC,
+      ADD COLUMN IF NOT EXISTS pnl_percent NUMERIC NOT NULL DEFAULT 0,
       ADD COLUMN IF NOT EXISTS input_message_id TEXT,
+      ADD COLUMN IF NOT EXISTS trade_log_message_id TEXT,
       ADD COLUMN IF NOT EXISTS channel_id TEXT,
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
 
+  // 3) Helpers
+  const colExists = async (table, col) => {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
+      [table, col]
+    );
+    return rows.length > 0;
+  };
   const makeIndex = async (idxName, sql) => {
     const { rows } = await pool.query(`SELECT to_regclass($1) AS exists`, [idxName]);
     if (!rows[0].exists) await pool.query(sql);
   };
 
-  await makeIndex("idx_trades_created_at", `CREATE INDEX idx_trades_created_at ON trades (created_at DESC);`);
-  await makeIndex("idx_trades_user_pnl", `CREATE INDEX idx_trades_user_pnl ON trades (username, pnl_percent DESC);`);
-  await makeIndex("idx_trades_pnl", `CREATE INDEX idx_trades_pnl ON trades (pnl_percent DESC);`);
+  // 4) Indexen alleen als kolommen bestaan
+  if (await colExists("trades", "created_at")) {
+    await makeIndex("idx_trades_created_at", `CREATE INDEX idx_trades_created_at ON trades (created_at DESC);`);
+  }
+  if ((await colExists("trades", "username")) && (await colExists("trades","pnl_percent"))) {
+    await makeIndex("idx_trades_user_pnl", `CREATE INDEX idx_trades_user_pnl ON trades (username, pnl_percent DESC);`);
+  }
+  if (await colExists("trades", "pnl_percent")) {
+    await makeIndex("idx_trades_pnl", `CREATE INDEX idx_trades_pnl ON trades (pnl_percent DESC);`);
+  }
 }
 
 // ------------ DISCORD ------------
@@ -94,7 +118,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers, // handig voor naam->ID lookup
+    GatewayIntentBits.GuildMembers, // handig voor naam->ID lookup bij backfill
   ],
   partials: [Partials.Channel, Partials.Message],
 });
