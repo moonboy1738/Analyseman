@@ -1,4 +1,4 @@
-// index.js — Analyesman (ephemeral ACK + kanaalpost, exact PnL uit trade-log, Trade links, embed-budget safe)
+// index.js — Analyesman (ephemeral ACK + kanaalpost, exact PnL uit trade-log, Trade links overal, budget safe)
 
 import {
   Client,
@@ -219,7 +219,7 @@ async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 10000 
       if (out.length >= max) break;
     }
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 80));
+    await new Promise(r => setTimeout(r, 80)); // adem tegen rate limit
   }
   return out;
 }
@@ -254,11 +254,8 @@ async function getWeeklyTopFromLog(limit = 10) {
 // ----------------- RENDER + BUDGETEER -----------------
 const EMBED_DESC_MAX = 4096;          // per embed
 const MESSAGE_EMBEDS_BUDGET = 6000;   // totaal per bericht
-const LINE_MAX = 150;
 
-const trim = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
-
-// één regel (met blauwe "(Trade)"-link)
+// NIET trims op regelniveau meer → links blijven heel
 function buildLine(r, idx, withLink = true) {
   const tag = medal(idx);
   const user = `**${r.username}**`;
@@ -268,11 +265,12 @@ function buildLine(r, idx, withLink = true) {
   const link = withLink && r.trade_log_message_id
     ? `  ${tradeLink(GUILD_ID, TRADE_LOG_CHANNEL_ID, r.trade_log_message_id)}`
     : "";
-  return trim(`${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`, LINE_MAX);
+  return `${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`;
 }
 
-// budgetteer: eerst met link; zo niet passend → zonder link; dan items reduceren
-function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
+// budgetteer: eventueel dwing links af; reduceer dan aantal regels, maar trim geen links
+function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed, options = {}) {
+  const { forceLinks = false } = options;
   const useRows = rows.slice(0, preferredCount);
   let withLink = true;
   let count = useRows.length;
@@ -285,13 +283,14 @@ function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
 
   while (true) {
     description = buildDesc();
-    if (description.length > EMBED_DESC_MAX) { count = Math.max(1, Math.floor(count * 0.9)); continue; }
+    if (description.length > EMBED_DESC_MAX) { count = Math.max(1, Math.floor(count * 0.95)); continue; }
     const approxSize = title.length + description.length + 50;
     if (approxSize <= budgetForThisEmbed) break;
 
-    if (withLink) { withLink = false; continue; }
-    if (count > 1) { count = Math.max(1, Math.floor(count * 0.9)); continue; }
-    description = trim(description, Math.min(EMBED_DESC_MAX, budgetForThisEmbed - title.length - 10));
+    if (withLink && !forceLinks) { withLink = false; continue; }
+    if (count > 1) { count = Math.max(1, Math.floor(count * 0.95)); continue; }
+    // laatste redmiddel: hard cap (maar zonder link-vernietiging)
+    description = description.slice(0, Math.min(EMBED_DESC_MAX, Math.max(0, budgetForThisEmbed - title.length - 10)));
     break;
   }
 
@@ -304,10 +303,10 @@ function buildAllTimeEmbeds(best, worst, totals) {
   const wBudget = Math.floor(totalBudget * 0.45);
   const tBudget = Math.floor(totalBudget * 0.10);
 
-  const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget);
-  const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget);
+  // LINKS verplicht voor top 25
+  const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget, { forceLinks: true });
+  const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget, { forceLinks: true });
 
-  // Totals: toon simpel "naam  `+xx.xx%`"
   const totalsRows = totals.map((r) => ({
     username: r.username,
     symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
@@ -319,7 +318,7 @@ function buildAllTimeEmbeds(best, worst, totals) {
 
 function buildWeeklyEmbed(rows) {
   const budget = MESSAGE_EMBEDS_BUDGET - 200;
-  return renderWithBudget(rows, "📈 Top 10 Weekly Trades (laatste 7 dagen)", 10, budget);
+  return renderWithBudget(rows, "📈 Top 10 Weekly Trades (laatste 7 dagen)", 10, budget, { forceLinks: true });
 }
 
 // ------------ STARTUP ------------
@@ -404,7 +403,7 @@ client.on("interactionCreate", async (i) => {
     catch (e2) { console.error("Kon niet ACK'en:", e2); return; }
   }
 
-  // 2) Data uit #📝-trade-log ophalen en als los bericht in #🏆-leaderboard posten
+  // 2) Data uit #📝-trade-log ophalen
   try {
     if (i.commandName === "lb_alltime") {
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
@@ -412,8 +411,12 @@ client.on("interactionCreate", async (i) => {
         await i.editReply("Geen trades gevonden in #📝-trade-log.");
         return;
       }
-      const embeds = buildAllTimeEmbeds(best, worst, totals);
-      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds });
+      const [eb1, eb2, eb3] = buildAllTimeEmbeds(best, worst, totals);
+
+      // Post in twee berichten om 6000-budget te garanderen — mét (Trade) links
+      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb1] });
+      await safeChannelSend(LEADERBOARD_CHANNEL_ID, { embeds: [eb2, eb3] });
+
       await i.editReply("Klaar ✅ — lijst gepost in #🏆-leaderboard.");
       return;
     }
@@ -498,8 +501,9 @@ async function postAllTimeNow() {
   try {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const { best, worst, totals } = await getAllTimeFromLog(25, 25);
-    const embeds = buildAllTimeEmbeds(best, worst, totals);
-    await ch.send({ embeds });
+    const [eb1, eb2, eb3] = buildAllTimeEmbeds(best, worst, totals);
+    await ch.send({ embeds: [eb1] });
+    await ch.send({ embeds: [eb2, eb3] });
   } catch (e) {
     console.error("auto alltime error:", e);
   }
