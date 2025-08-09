@@ -1,5 +1,4 @@
 // index.js  —  clean build, no extra deps
-import 'dotenv/config';
 import {
   Client,
   GatewayIntentBits,
