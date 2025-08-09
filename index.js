@@ -1,4 +1,4 @@
-// index.js — Analyesman (Heroku safe, auto-history + LB from trade-log, fast replies)
+// index.js — Analyesman (Heroku safe, auto-history + LB from trade-log, embed budget)
 
 import {
   Client,
@@ -36,7 +36,7 @@ const EXCLUDE_USERNAMES = [
   "jordanbelfort",
 ];
 
-// ------------ DB (storage voor archief; leaderboards lezen uit trade-log) ------------
+// ------------ DB (archief; leaderboards lezen uit trade-log) ------------
 const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -81,7 +81,6 @@ async function ensureDb() {
       ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
   `);
 
-  // legacy kolommen permissief
   const relaxLegacy = async (col) => {
     const r = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name=$1`,
@@ -114,7 +113,7 @@ const client = new Client({
 
 // ====== HELPERS (input/trade-log blijven EXACT) ======
 const medal = (i) => (i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `${i + 1}.`);
-const tradeLink = (gid, cid, mid) => `[(Trade)](https://discord.com/channels/${gid}/${cid}/${mid})`;
+const tradeLink = (gid, cid, mid) => `[Trade](https://discord.com/channels/${gid}/${cid}/${mid})`; // korter
 const pnlBadge = (pnl) => {
   const v = Number(pnl);
   const s = isFinite(v) ? (v >= 0 ? `+${v.toFixed(2)}%` : `${v.toFixed(2)}%`) : "NaN%";
@@ -130,7 +129,7 @@ function formatValueWithInputPrecision(raw) {
   return `$${s}`;
 }
 
-// Parse regex (accepteert ASCII 'x' en '×', en unicode minus U+2212)
+// Parse regex
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
 const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
 const ENTRY_RE     = /Entry:\s+\$([0-9]*\.?[0-9]+)/i;
@@ -152,7 +151,7 @@ const formatTradeLog = (usernameLower, symbol, side, leverage, entryRaw, exitRaw
   return `${head}\n${body.join("\n")}`;
 };
 
-// ------------- COMMANDS (leaderboards) -------------
+// ------------- COMMANDS -------------
 const cmds = [
   new SlashCommandBuilder().setName("lb_alltime").setDescription("Post All-Time Top 25 wins + worst 25 + totals (nu)"),
   new SlashCommandBuilder().setName("lb_daily").setDescription("Post Top 10 van de week (nu)"),
@@ -188,7 +187,7 @@ async function insertTrade(row) {
   return rows[0];
 }
 
-// ----------------- LEADERBOARD DATA FROM #trade-log -----------------
+// ----------------- DATA UIT #trade-log -----------------
 const safeNum = (x) => (Number.isFinite(x) ? x : 0);
 const parsePnlNumber = (pill) => parseFloat(pill.replace("%","").replace("\u2212","-"));
 
@@ -226,7 +225,6 @@ function parseTradeFromMessage(m) {
   };
 }
 
-// Efficiënt scannen met tijdslimiet + harde limiet
 async function scanTradesFromLog({ days = null, max = 4000, timeLimitMs = 15000 } = {}) {
   const ch = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   const out = [];
@@ -283,54 +281,87 @@ async function getWeeklyTopFromLog(limit = 10) {
   return trades.sort((a,b) => b.pnl_percent - a.pnl_percent).slice(0, limit);
 }
 
-// ----------------- RENDER (Trade link + veilige lengtes) -----------------
-const EMBED_MAX = 4096;
-const LINE_MAX = 180;
+// ----------------- RENDER + BUDGETEER -----------------
+const EMBED_DESC_MAX = 4096;      // Discord per-embed description
+const MESSAGE_EMBEDS_BUDGET = 6000; // Discord totaal over ALLE embeds in één bericht
+const LINE_MAX = 140;             // iets strakker om ruimte te besparen
+
 const trim = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
 
-function renderBestWorstLines(rows) {
-  if (!rows || rows.length === 0) return ["Geen resultaten."];
-  const lines = rows.map((r, idx) => {
-    const tag = medal(idx);
-    const user = `**${r.username}**`;
-    const item = `${r.symbol.toUpperCase()} ${r.side}`;
-    const lev = `${r.leverage_x}x`; // in leaderboard 'x' (zoals screenshot)
-    const pnl = pnlBadge(r.pnl_percent);
-    const link = r.trade_log_message_id
-      ? `  ${tradeLink(GUILD_ID, TRADE_LOG_CHANNEL_ID, r.trade_log_message_id)}`
-      : "";
-    return trim(`${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`, LINE_MAX);
-  });
-
-  const out = [];
-  let total = 0;
-  for (const l of lines) {
-    if (total + l.length + 1 > EMBED_MAX) break;
-    out.push(l);
-    total += l.length + 1;
-  }
-  return out.length ? out : ["Geen resultaten."];
+// bouw één regel
+function buildLine(r, idx, withLink = true) {
+  const tag = medal(idx);
+  const user = `**${r.username}**`;
+  const item = `${r.symbol.toUpperCase()} ${r.side}`;
+  const lev = `${r.leverage_x}x`;
+  const pnl = pnlBadge(r.pnl_percent);
+  const link = withLink && r.trade_log_message_id
+    ? `  ${tradeLink(GUILD_ID, TRADE_LOG_CHANNEL_ID, r.trade_log_message_id)}`
+    : "";
+  return trim(`${tag}  ${user}  ${item}  ${lev}  ${pnl}${link}`, LINE_MAX);
 }
 
-function renderTotalsLines(rows) {
-  if (!rows || rows.length === 0) return ["Geen resultaten."];
+// render met budget: eerst met links; als te lang -> zonder links; nog te lang -> items verminderen
+function renderWithBudget(rows, title, preferredCount, budgetForThisEmbed) {
+  const useRows = rows.slice(0, preferredCount);
+  let withLink = true;
+  let count = useRows.length;
+  let description = "";
 
-  const lines = rows.map((r, idx) => {
-    const tag = medal(idx);
-    const user = `**${r.username}**`;
-    const s = Number(r.total);
-    const label = isFinite(s) ? (s >= 0 ? `+${s.toFixed(2)}%` : `${s.toFixed(2)}%`) : "NaN%";
-    return trim(`${tag}  ${user}  \`${label}\``, LINE_MAX);
-  });
+  const buildDesc = () => {
+    const lines = useRows.slice(0, count).map((r, i) => buildLine(r, i, withLink));
+    return lines.join("\n");
+  };
 
-  const out = [];
-  let total = 0;
-  for (const l of lines) {
-    if (total + l.length + 1 > EMBED_MAX) break;
-    out.push(l);
-    total += l.length + 1;
+  while (true) {
+    description = buildDesc();
+    // cap per-embed description
+    if (description.length > EMBED_DESC_MAX) {
+      count = Math.max(1, Math.floor(count * 0.9));
+      continue;
+    }
+
+    // check tegen gezamenlijk budget (ruwe schatting incl titel en marge)
+    const approxSize = title.length + description.length + 50;
+    if (approxSize <= budgetForThisEmbed) break;
+
+    if (withLink) { withLink = false; continue; }
+    if (count > 1) { count = Math.max(1, Math.floor(count * 0.9)); continue; }
+    // laatste redmiddel: hard trim
+    description = trim(description, Math.min(EMBED_DESC_MAX, budgetForThisEmbed - title.length - 10));
+    break;
   }
-  return out.length ? out : ["Geen resultaten."];
+
+  return new EmbedBuilder().setColor(0x111827).setTitle(title).setDescription(description);
+}
+
+// helper om 3 embeds in één bericht binnen 6000 total te houden
+function buildAllTimeEmbeds(best, worst, totals) {
+  // verdeel budget grofweg 45% / 45% / 10% en laat de budgetter in elke embed zelf fine-tunen
+  const totalBudget = MESSAGE_EMBEDS_BUDGET - 100; // buffer
+  const bBudget = Math.floor(totalBudget * 0.45);
+  const wBudget = Math.floor(totalBudget * 0.45);
+  const tBudget = Math.floor(totalBudget * 0.10);
+
+  const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget);
+  const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget);
+  const eb3 = renderWithBudget(
+    totals.map((r, idx) => ({
+      username: r.username,
+      symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
+    })),
+    "📊 Totale PnL % (best + worst)",
+    25,
+    tBudget
+  );
+
+  return [eb1, eb2, eb3];
+}
+
+function buildWeeklyEmbed(rows) {
+  // 1 embed → we mogen praktisch het hele 6000 budget gebruiken, maar hou ruime marge
+  const budget = MESSAGE_EMBEDS_BUDGET - 200;
+  return renderWithBudget(rows, "📈 Top 10 Weekly Trades (laatste 7 dagen)", 10, budget);
 }
 
 // ------------- RUNTIME -------------
@@ -411,32 +442,14 @@ client.on("interactionCreate", async (i) => {
       try { await i.editReply("Bezig met verzamelen…"); } catch {}
 
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
-      console.log("[LB_ALLTIME]",
-        "best:", best?.length ?? 0,
-        "worst:", worst?.length ?? 0,
-        "totals:", totals?.length ?? 0
-      );
+      console.log("[LB_ALLTIME]", "best:", best?.length ?? 0, "worst:", worst?.length ?? 0, "totals:", totals?.length ?? 0);
 
       if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
         return fail("Geen trades gevonden in #📝-trade-log (parser vond 0 items).");
       }
 
-      const eb1 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("🏆 Top 25 All-time Winsten")
-        .setDescription(renderBestWorstLines(best).join("\n"));
-
-      const eb2 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📉 Top 25 All-time Verliezen")
-        .setDescription(renderBestWorstLines(worst).join("\n"));
-
-      const eb3 = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📊 Totale PnL % (best + worst)")
-        .setDescription(renderTotalsLines(totals).join("\n"));
-
-      await i.editReply({ content: "", embeds: [eb1, eb2, eb3] });
+      const embeds = buildAllTimeEmbeds(best, worst, totals);
+      await i.editReply({ content: "", embeds });
       return;
     }
 
@@ -445,14 +458,9 @@ client.on("interactionCreate", async (i) => {
 
       const weekly = await getWeeklyTopFromLog(10);
       console.log("[LB_DAILY]", "weekly:", weekly?.length ?? 0);
-
       if (!weekly?.length) return fail("Geen trades gevonden in de laatste 7 dagen.");
 
-      const eb = new EmbedBuilder()
-        .setColor(0x111827)
-        .setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)")
-        .setDescription(renderBestWorstLines(weekly).join("\n"));
-
+      const eb = buildWeeklyEmbed(weekly);
       await i.editReply({ content: "", embeds: [eb] });
       return;
     }
@@ -521,12 +529,8 @@ async function postAllTimeNow() {
   try {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const { best, worst, totals } = await getAllTimeFromLog(25, 25);
-
-    const eb1 = new EmbedBuilder().setColor(0x111827).setTitle("🏆 Top 25 All-time Winsten").setDescription(renderBestWorstLines(best).join("\n"));
-    const eb2 = new EmbedBuilder().setColor(0x111827).setTitle("📉 Top 25 All-time Verliezen").setDescription(renderBestWorstLines(worst).join("\n"));
-    const eb3 = new EmbedBuilder().setColor(0x111827).setTitle("📊 Totale PnL % (best + worst)").setDescription(renderTotalsLines(totals).join("\n"));
-
-    await ch.send({ embeds: [eb1, eb2, eb3] });
+    const embeds = buildAllTimeEmbeds(best, worst, totals);
+    await ch.send({ embeds });
   } catch (e) {
     console.error("auto alltime error:", e);
   }
@@ -536,7 +540,7 @@ async function postWeeklyNow() {
   try {
     const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
     const weekly = await getWeeklyTopFromLog(10);
-    const eb = new EmbedBuilder().setColor(0x111827).setTitle("📈 Top 10 Weekly Trades (laatste 7 dagen)").setDescription(renderBestWorstLines(weekly).join("\n"));
+    const eb = buildWeeklyEmbed(weekly);
     await ch.send({ embeds: [eb] });
   } catch (e) {
     console.error("auto weekly error:", e);
