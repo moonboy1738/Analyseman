@@ -67,7 +67,7 @@ async function ensureDb() {
     );
   `);
 
-  // --- schema migraties: voeg ontbrekende kolommen veilig toe ---
+  // schema migraties (safe, idempotent)
   await pool.query(`
     ALTER TABLE trades
       ADD COLUMN IF NOT EXISTS trade_log_message_id TEXT,
@@ -94,7 +94,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers, // voor backfill naam->ID lookup
+    GatewayIntentBits.GuildMembers, // handig voor naam->ID lookup
   ],
   partials: [Partials.Channel, Partials.Message],
 });
@@ -356,24 +356,41 @@ client.on("interactionCreate", async (i) => {
     }
 
     if (i.commandName === "backfill") {
-      // alleen voor mensen met Manage Server
-      const member = await i.guild.members.fetch(i.user.id);
-      if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
-        await i.reply({ content: "Je hebt geen toestemming voor /backfill.", ephemeral: true });
-        return;
-      }
-      await i.reply({ content: "Backfill gestart. Dit kan even duren…", ephemeral: true });
       try {
+        // permissie check zonder fetch (voorkomt 3s no-response)
+        const hasManage = (() => {
+          try {
+            const pf = new PermissionsBitField(i.member?.permissions);
+            return pf.has(PermissionsBitField.Flags.ManageGuild);
+          } catch {
+            return false;
+          }
+        })();
+
+        if (!hasManage) {
+          await i.reply({ content: "Je hebt geen toestemming voor /backfill.", ephemeral: true });
+          return;
+        }
+
+        // reageer binnen 3s en draai daarna
+        await i.deferReply({ ephemeral: true });
+
         const { processed, skipped, errors } = await runBackfillVerbose();
+
         let msg = `Backfill klaar. Verwerkt: ${processed}, overgeslagen: ${skipped}.`;
         if (errors.length) {
           msg += `\nFouten (${errors.length}):\n` + errors.slice(0,5).map(e => `• ${e}`).join("\n");
           if (errors.length > 5) msg += `\n(+${errors.length - 5} extra)`;
         }
-        await i.followUp({ content: msg, ephemeral: true });
+
+        await i.editReply({ content: msg });
       } catch (e) {
         console.error("BACKFILL FATAL:", e);
-        await i.followUp({ content: `Backfill faalde: ${e?.message || e}`, ephemeral: true });
+        if (i.deferred || i.replied) {
+          await i.editReply({ content: `Backfill faalde: ${e?.message || e}` });
+        } else {
+          await i.reply({ content: `Backfill faalde: ${e?.message || e}`, ephemeral: true });
+        }
       }
     }
   } catch (err) {
