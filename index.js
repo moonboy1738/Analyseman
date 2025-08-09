@@ -1,4 +1,4 @@
-// index.js — Analyesman (robust slash acks + fallback, exact PnL from trade-log, Trade links, embed-budget safe)
+// index.js — Analyesman (ultra-robust slash ACK, exact PnL from trade-log, Trade links, embed-budget safe)
 
 import {
   Client,
@@ -63,7 +63,6 @@ async function ensureDb() {
     );
   `);
 
-  // legacy kolommen permissief
   const relaxLegacy = async (col) => {
     const r = await pool.query(
       `SELECT 1 FROM information_schema.columns WHERE table_name='trades' AND column_name=$1`,
@@ -112,10 +111,9 @@ function formatValueWithInputPrecision(raw) {
   return `$${s}`;
 }
 
-// Parse regex (exact jouw format)
+// Parse regex (exact jouw format in #📝-trade-log)
 const HEADER_REGEX = /^\*\*(.+?)\*\*\s+`([+\-\u2212]?\d+(?:\.\d+)?%)`/m;
 const BODY_REGEX   = /([A-Z0-9._/-]+)\s+(Long|Short)\s+(\d{1,4})(?:x|×)\s*/m;
-// Alleen voor conservatieve parsing; geen herberekening van PnL
 // const ENTRY_RE     = /Entry:\s+\$([0-9]*\.?[0-9]+)/i;
 // const EXIT_RE      = /Exit:\s+\$([0-9]*\.?[0-9]+)/i;
 
@@ -199,7 +197,7 @@ function parseTradeFromMessage(m) {
   };
 }
 
-async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 12000 } = {}) {
+async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 10000 } = {}) {
   const ch = await client.channels.fetch(TRADE_LOG_CHANNEL_ID);
   const out = [];
   let lastId = null;
@@ -223,13 +221,13 @@ async function scanTradesFromLog({ days = null, max = 3000, timeLimitMs = 12000 
       if (out.length >= max) break;
     }
     lastId = msgs[msgs.length - 1].id;
-    await new Promise(r => setTimeout(r, 90));
+    await new Promise(r => setTimeout(r, 80)); // even ademhalen tegen rate limit
   }
   return out;
 }
 
 async function getAllTimeFromLog(limitBest = 25, limitWorst = 25) {
-  const trades = await scanTradesFromLog({ days: null, max: 3000, timeLimitMs: 12000 });
+  const trades = await scanTradesFromLog({ days: null, max: 3000, timeLimitMs: 10000 });
 
   const best = [...trades].sort((a,b) => b.pnl_percent - a.pnl_percent).slice(0, limitBest);
   const worst = [...trades].sort((a,b) => a.pnl_percent - b.pnl_percent).slice(0, limitWorst);
@@ -251,7 +249,7 @@ async function getAllTimeFromLog(limitBest = 25, limitWorst = 25) {
 }
 
 async function getWeeklyTopFromLog(limit = 10) {
-  const trades = await scanTradesFromLog({ days: 7, max: 3000, timeLimitMs: 12000 });
+  const trades = await scanTradesFromLog({ days: 7, max: 3000, timeLimitMs: 10000 });
   return trades.sort((a,b) => b.pnl_percent - a.pnl_percent).slice(0, limit);
 }
 
@@ -311,7 +309,7 @@ function buildAllTimeEmbeds(best, worst, totals) {
   const eb1 = renderWithBudget(best, "🏆 Top 25 All-time Winsten", 25, bBudget);
   const eb2 = renderWithBudget(worst, "📉 Top 25 All-time Verliezen", 25, wBudget);
 
-  // Totals: render als eenvoudige "naam  `+xx.xx%`"
+  // Totals: toon simpel "naam  `+xx.xx%`"
   const totalsRows = totals.map((r) => ({
     username: r.username,
     symbol: "", side: "", leverage_x: "", pnl_percent: r.total, trade_log_message_id: null
@@ -327,14 +325,18 @@ function buildWeeklyEmbed(rows) {
 }
 
 // ---------- robust interaction helpers ----------
-async function safeDefer(i) {
-  try { await i.deferReply({ ephemeral: false }); return true; }
-  catch (e) { console.error("deferReply failed:", e); return false; }
+async function safeReply(i, payload) {
+  try { await i.reply(payload); return true; }
+  catch (e) {
+    console.warn("reply failed, try defer:", e?.code || e?.message || e);
+    try { await i.deferReply({ ephemeral: false }); await i.editReply(payload); return true; }
+    catch (e2) { console.error("reply+defer failed:", e2); return false; }
+  }
 }
 async function safeEdit(i, payload) {
   try { await i.editReply(payload); return true; }
   catch (e) {
-    console.warn("editReply failed, falling back to channel:", e?.code || e?.message || e);
+    console.warn("editReply failed, fallback to channel:", e?.code || e?.message || e);
     try {
       const ch = await client.channels.fetch(i.channelId);
       await ch.send(payload); // altijd nog resultaat in kanaal
@@ -401,42 +403,36 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-// ---- Slash commands (supersnelle ACK + fallback) ----
+// ---- Slash commands (instant ACK + later edit; altijd resultaat) ----
 client.on("interactionCreate", async (i) => {
   if (!i.isChatInputCommand()) return;
 
-  const deferred = await safeDefer(i);
-  if (!deferred) {
-    // laatste redmiddel: stuur toch iets naar het kanaal
-    const ch = await client.channels.fetch(i.channelId);
-    await ch.send("Kon niet starten (defer failed). Probeer zo nog eens.");
+  // 1) DIRECTE ACK binnen < 200ms
+  const ackOk = await safeReply(i, { content: "Bezig met verzamelen…", ephemeral: false });
+  if (!ackOk) {
+    // als dit faalt is er iets mis met rechten of verbinding; we kunnen niets meer doen
     return;
   }
 
+  // 2) Werklast uitvoeren en het bericht bijwerken
   try {
     if (i.commandName === "lb_alltime") {
-      await safeEdit(i, { content: "Bezig met verzamelen…" });
-
       const { best, worst, totals } = await getAllTimeFromLog(25, 25);
       if ((!best?.length) && (!worst?.length) && (!totals?.length)) {
         await safeEdit(i, { content: "Geen trades gevonden in #📝-trade-log." });
         return;
       }
-
       const embeds = buildAllTimeEmbeds(best, worst, totals);
       await safeEdit(i, { content: "", embeds });
       return;
     }
 
     if (i.commandName === "lb_daily") {
-      await safeEdit(i, { content: "Bezig met verzamelen…" });
-
       const weekly = await getWeeklyTopFromLog(10);
       if (!weekly?.length) {
         await safeEdit(i, { content: "Geen trades gevonden in de laatste 7 dagen." });
         return;
       }
-
       const eb = buildWeeklyEmbed(weekly);
       await safeEdit(i, { content: "", embeds: [eb] });
       return;
@@ -541,3 +537,7 @@ function setupCrons() {
     process.exit(1);
   }
 })();
+
+// ---- Global guards voor rare crashes ----
+process.on("unhandledRejection", (e) => console.error("UNHANDLED REJECTION:", e));
+process.on("uncaughtException", (e) => console.error("UNCAUGHT EXCEPTION:", e));
